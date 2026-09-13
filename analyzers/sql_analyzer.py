@@ -1,117 +1,184 @@
+import os
 import re
 from pathlib import Path
+from typing import List, Tuple
 from core.issue import Issue, Severity, Layer
 
 class SqlAnalyzer:
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = Path(path)
-        self.issues = []
+        self.issues: List[Issue] = []
 
-    def analyze(self):
-        # Scan .sql files
+    def analyze(self) -> List[Issue]:
+        # Scan dedicated .sql files
         for f in self.path.rglob('*.sql'):
-            if 'node_modules' in str(f): continue
+            if any(x in str(f) for x in ['node_modules', 'dist/', '.git']):
+                continue
             try:
-                src = f.read_text(errors='ignore').upper()
-                rel = str(f.relative_to(self.path))
-                self._check_sql_file(src, rel, f)
-            except: pass
-        # Scan JS/TS files for inline SQL strings
+                src = f.read_text(encoding='utf-8', errors='ignore')
+                rel = str(f.relative_to(self.path)).replace('\\', '/')
+                lines = src.splitlines()
+                self._check_sql_file(src, lines, rel)
+            except Exception:
+                pass
+
+        # Scan .js and .ts files for inline SQL strings
         for f in list(self.path.rglob('*.js')) + list(self.path.rglob('*.ts')):
-            if any(x in str(f) for x in ['node_modules', 'dist/', '.spec.']): continue
+            if any(x in str(f) for x in ['node_modules', 'dist/', '.spec.', '.d.ts', '.git']):
+                continue
             try:
-                src = f.read_text(errors='ignore')
-                rel = str(f.relative_to(self.path))
-                self._check_inline_sql(src, rel)
-            except: pass
+                src = f.read_text(encoding='utf-8', errors='ignore')
+                rel = str(f.relative_to(self.path)).replace('\\', '/')
+                lines = src.splitlines()
+                self._check_inline_sql(src, lines, rel)
+            except Exception:
+                pass
+
         return self.issues
 
-    def _check_sql_file(self, src, rel, f):
-        # SELECT * usage
-        select_star = len(re.findall(r'SELECT\s+\*\s+FROM', src))
-        if select_star > 0:
-            self.issues.append(Issue(
-                id='SQL001', title=f'SELECT * Usage ({select_star} queries)',
-                description=f'{select_star} queries use SELECT *. This fetches ALL columns including large TEXT/BLOB fields you may not need. Increases I/O, memory, and network transfer. Breaks app when columns are added/removed.',
-                fix='Specify exact columns needed: SELECT id, name, status FROM table',
-                code_before='SELECT * FROM orders WHERE user_id = ?\n-- Fetches 30 columns, including large JSON/BLOB fields',
-                code_after='SELECT id, status, total, created_at FROM orders WHERE user_id = ?\n-- Only 4 columns needed by the API',
-                file=rel, severity=Severity.HIGH, layer=Layer.DATABASE,
-                impact=7, effort=3, occurrences=select_star,
-                perf_gain='Reduces row transfer size, faster query execution'
-            ))
-        # Missing WHERE clause on UPDATE/DELETE
-        dangerous = re.findall(r'(?:UPDATE|DELETE FROM)\s+\w+\s*(?:SET[^;]+)?(?:;|$)', src)
-        no_where = [q for q in dangerous if 'WHERE' not in q]
-        if no_where:
-            self.issues.append(Issue(
-                id='SQL002', title=f'UPDATE/DELETE Without WHERE Clause',
-                description=f'Found {len(no_where)} UPDATE or DELETE statements with no WHERE clause. These affect ALL rows in the table. One accidental call corrupts the entire dataset.',
-                fix='Always add a WHERE clause. Use transactions for multi-step operations.',
-                code_before='UPDATE users SET status = \'inactive\';\n-- Updates ALL users!',
-                code_after='UPDATE users SET status = \'inactive\'\nWHERE last_login < NOW() - INTERVAL 90 DAY;',
-                file=rel, severity=Severity.CRITICAL, layer=Layer.DATABASE,
-                impact=10, effort=2, occurrences=len(no_where),
-                perf_gain='Data integrity protection; prevents full-table locks'
-            ))
-        # No LIMIT on SELECT
-        selects = re.findall(r'SELECT\b.+?FROM\b.+?(?:WHERE.+?)?(?:;|$)', src, re.DOTALL)
-        no_limit = [s for s in selects if 'LIMIT' not in s and 'TOP' not in s and len(s) < 500]
-        if len(no_limit) > 2:
-            self.issues.append(Issue(
-                id='SQL003', title=f'{len(no_limit)} SELECT Queries Without LIMIT',
-                description=f'{len(no_limit)} SELECT queries have no LIMIT clause. These will return ALL matching rows. On a 1M-row table this returns 1M rows to the application layer.',
-                fix='Add LIMIT to all queries used in lists/grids. Use cursor-based pagination for large datasets.',
-                code_before='SELECT id, name FROM products WHERE active = 1;\n-- Returns all active products (maybe 500,000)',
-                code_after='SELECT id, name FROM products WHERE active = 1\nLIMIT 50 OFFSET ?; -- paginated',
-                file=rel, severity=Severity.HIGH, layer=Layer.DATABASE,
-                impact=9, effort=2, occurrences=len(no_limit),
-                perf_gain='Limits result set to manageable size regardless of table growth'
-            ))
-        # Missing indexes detection (look for CREATE TABLE without indexes)
-        tables = re.findall(r'CREATE\s+TABLE\s+(\w+)\s*\(([^;]+)\)', src, re.DOTALL)
-        for tname, tdef in tables:
-            fk_cols = re.findall(r'(\w+_ID|\w+_FK|FOREIGN\s+KEY\s*\((\w+)\))', tdef)
-            index_defs = re.findall(r'INDEX|KEY\s+\w|UNIQUE', tdef)
-            if fk_cols and not index_defs:
+    def _is_suppressed(self, lines: List[str], line_idx: int, rule_id: str) -> bool:
+        check_lines = []
+        if 0 <= line_idx < len(lines):
+            check_lines.append(lines[line_idx])
+        if 0 <= line_idx - 1 < len(lines):
+            check_lines.append(lines[line_idx - 1])
+        for cl in check_lines:
+            if f'perf-ignore {rule_id}' in cl or 'perf-ignore-all' in cl:
+                return True
+        return False
+
+    def _find_line(self, lines: List[str], regex_or_str) -> Tuple[int, str]:
+        for idx, line in enumerate(lines, 1):
+            if isinstance(regex_or_str, str) and regex_or_str.lower() in line.lower():
+                return idx, line.strip()
+            elif hasattr(regex_or_str, 'search') and regex_or_str.search(line):
+                return idx, line.strip()
+        return 1, (lines[0].strip() if lines else '')
+
+    def _check_sql_file(self, src: str, lines: List[str], rel: str):
+        # SQL001: SELECT * Usage
+        select_star_count = len(re.findall(r'SELECT\s+\*\s+FROM', src, re.IGNORECASE))
+        if select_star_count > 0:
+            line_no, snippet = self._find_line(lines, re.compile(r'SELECT\s+\*\s+FROM', re.IGNORECASE))
+            if not self._is_suppressed(lines, line_no - 1, 'SQL001'):
                 self.issues.append(Issue(
-                    id='SQL004', title=f'Missing Index on Table: {tname}',
-                    description=f'Table {tname} has foreign key / relationship columns but no indexes defined. JOINs and WHERE clauses on these columns perform full table scans O(N) instead of O(log N).',
-                    fix=f'Add indexes: CREATE INDEX idx_{tname.lower()}_fk ON {tname}(user_id);',
-                    code_before=f'CREATE TABLE {tname} (\n  id INT PRIMARY KEY,\n  user_id INT,  -- no index!\n  order_id INT  -- no index!\n);\n-- JOIN on user_id = full table scan',
-                    code_after=f'CREATE TABLE {tname} (\n  id INT PRIMARY KEY,\n  user_id INT,\n  order_id INT,\n  INDEX idx_user (user_id),\n  INDEX idx_order (order_id)\n);',
-                    file=rel, severity=Severity.CRITICAL, layer=Layer.DATABASE,
-                    impact=9, effort=2, occurrences=len(fk_cols),
-                    perf_gain='Turns O(N) table scans into O(log N) index lookups'
+                    id='SQL001',
+                    title=f'SELECT * Over-fetching ({select_star_count} occurrences)',
+                    description='Fetching all table columns with SELECT * wastes database memory, network bandwidth, and prevents index-only query execution plans.',
+                    fix='Explicitly enumerate the necessary columns: `SELECT id, name, status FROM table`.',
+                    code_before='SELECT * FROM orders WHERE user_id = ?;',
+                    code_after='SELECT id, total_amount, status, created_at FROM orders WHERE user_id = ?;',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Database I/O',
+                    severity=Severity.HIGH,
+                    layer=Layer.DATABASE,
+                    impact=7,
+                    effort=2,
+                    occurrences=select_star_count,
+                    perf_gain='Reduces row serialization size and network transfer'
                 ))
 
-    def _check_inline_sql(self, src, rel):
-        # Find SQL strings in JS/TS
-        sql_strings = re.findall(r'[`\'"](SELECT[^`\'"]{10,})[`\'"]', src, re.IGNORECASE)
-        if not sql_strings: return
-        # String concatenation in SQL (SQL injection + perf)
-        concat_sql = re.findall(r'[`\'"](SELECT[^`\'"]+)[`\'"]\s*\+', src, re.IGNORECASE)
-        if concat_sql:
-            self.issues.append(Issue(
-                id='SQL005', title='SQL Built by String Concatenation',
-                description='SQL query built by string concatenation prevents the DB from caching query execution plans. Each unique string = new plan compilation. Also creates SQL injection vulnerability.',
-                fix='Use parameterized queries with ? placeholders. DB caches the plan and reuses it.',
-                code_before="const sql = 'SELECT * FROM users WHERE id = ' + userId;\n// New plan on every unique userId value",
-                code_after="const sql = 'SELECT * FROM users WHERE id = ?';\nawait db.query(sql, [userId]);\n// Plan cached and reused",
-                file=rel, severity=Severity.HIGH, layer=Layer.DATABASE,
-                impact=7, effort=3, occurrences=len(concat_sql),
-                perf_gain='Enables query plan caching, reduces DB CPU load'
-            ))
-        # LIKE with leading wildcard (can't use index)
-        leading_wildcard = re.findall(r"LIKE\s+['\"`]%", ''.join(sql_strings), re.IGNORECASE)
-        if leading_wildcard:
-            self.issues.append(Issue(
-                id='SQL006', title='LIKE With Leading Wildcard (Index Bypass)',
-                description=f'Found {len(leading_wildcard)} LIKE \'%value\' patterns. A leading % means the DB CANNOT use any index on that column — forces a full table scan every time.',
-                fix='For full-text search, use MySQL FULLTEXT index with MATCH() AGAINST(). Avoid leading % in LIKE.',
-                code_before="WHERE name LIKE '%smith%'\n-- Full table scan every time, ignores any index on 'name'",
-                code_after='-- Add fulltext index:\nALTER TABLE users ADD FULLTEXT(name);\n-- Query:\nWHERE MATCH(name) AGAINST(\'smith\' IN BOOLEAN MODE)',
-                file=rel, severity=Severity.HIGH, layer=Layer.DATABASE,
-                impact=8, effort=4, occurrences=len(leading_wildcard),
-                perf_gain='Turns full table scan into indexed lookup for search queries'
-            ))
+        # SQL004: Missing indexes on foreign keys
+        table_defs = re.finditer(r'CREATE\s+TABLE\s+(\w+)\s*\(([^;]+)\)', src, re.IGNORECASE | re.DOTALL)
+        for tbl in table_defs:
+            tname = tbl.group(1)
+            tbody = tbl.group(2)
+            has_fk = re.search(r'(\w+_id|\w+_fk)\s+INT', tbody, re.IGNORECASE) or 'FOREIGN KEY' in tbody.upper()
+            has_idx = any(idx_kw in tbody.upper() for idx_kw in ['INDEX', 'KEY ', 'UNIQUE'])
+            if has_fk and not has_idx:
+                line_no, snippet = self._find_line(lines, re.compile(rf'CREATE\s+TABLE\s+{tname}', re.IGNORECASE))
+                if not self._is_suppressed(lines, line_no - 1, 'SQL004'):
+                    self.issues.append(Issue(
+                        id='SQL004',
+                        title=f'Missing Foreign Key Index on Table `{tname}`',
+                        description=f'Table `{tname}` defines relationship foreign keys without explicit B-Tree indexes. Queries using JOIN or WHERE on foreign keys will execute full table scans.',
+                        fix=f'Add B-Tree indexes to foreign key columns: `INDEX idx_{tname.lower()}_fk (user_id)`.',
+                        code_before=f'CREATE TABLE {tname} (\n  id INT PRIMARY KEY,\n  user_id INT -- No index: causes O(N) table scans\n);',
+                        code_after=f'CREATE TABLE {tname} (\n  id INT PRIMARY KEY,\n  user_id INT,\n  INDEX idx_{tname.lower()}_user (user_id)\n);',
+                        file=rel,
+                        line_number=line_no,
+                        code_snippet=snippet,
+                        category='Indexing & Optimization',
+                        severity=Severity.CRITICAL,
+                        layer=Layer.DATABASE,
+                        impact=9,
+                        effort=2,
+                        occurrences=1,
+                        perf_gain='Converts O(N) table scans into O(log N) B-Tree seeks'
+                    ))
+
+        # SQL007: Deep OFFSET pagination antipattern
+        if re.search(r'OFFSET\s+[1-9]\d{3,}', src, re.IGNORECASE):
+            line_no, snippet = self._find_line(lines, re.compile(r'OFFSET\s+[1-9]\d{3,}', re.IGNORECASE))
+            if not self._is_suppressed(lines, line_no - 1, 'SQL007'):
+                self.issues.append(Issue(
+                    id='SQL007',
+                    title='Deep OFFSET Pagination Antipattern (O(N) Discard Waste)',
+                    description='High OFFSET values force the database engine to fetch and discard thousands of rows before returning the requested slice. Response latency degrades proportionally with page depth.',
+                    fix='Use keyset / cursor-based pagination: `WHERE id > :last_id ORDER BY id LIMIT 50`.',
+                    code_before='SELECT id, name FROM orders ORDER BY id LIMIT 50 OFFSET 10000;',
+                    code_after='SELECT id, name FROM orders WHERE id > :cursor ORDER BY id LIMIT 50;',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Query Performance',
+                    severity=Severity.HIGH,
+                    layer=Layer.DATABASE,
+                    impact=8,
+                    effort=3,
+                    occurrences=1,
+                    perf_gain='Constant O(1) query time regardless of pagination depth'
+                ))
+
+    def _check_inline_sql(self, src: str, lines: List[str], rel: str):
+        # SQL005: String concatenation in SQL queries
+        concat_matches = re.finditer(r'[`\'"](SELECT[^`\'"]+)[`\'"]\s*\+', src, re.IGNORECASE)
+        for m in concat_matches:
+            matched_text = m.group(0)
+            line_no, snippet = self._find_line(lines, matched_text[:20])
+            if not self._is_suppressed(lines, line_no - 1, 'SQL005'):
+                self.issues.append(Issue(
+                    id='SQL005',
+                    title='SQL Built via String Concatenation (Disables Execution Plan Cache)',
+                    description='Dynamic string concatenation generates a unique SQL text for every argument, preventing the database from reusing compiled execution plans. Also opens SQL injection risk.',
+                    fix='Use parameterized queries with `?` or `$1` placeholders so execution plans are cached.',
+                    code_before='const sql = "SELECT * FROM users WHERE status = \'" + status + "\'";',
+                    code_after='const sql = "SELECT id, name, status FROM users WHERE status = ?";\nawait db.query(sql, [status]);',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Execution Plan Cache',
+                    severity=Severity.HIGH,
+                    layer=Layer.DATABASE,
+                    impact=8,
+                    effort=2,
+                    occurrences=1,
+                    perf_gain='Enables query plan caching and eliminates SQL injection'
+                ))
+                break
+
+        # SQL006: LIKE with leading wildcard
+        leading_like = re.search(r"LIKE\s+['\"]%[^'\"]+['\"]", src, re.IGNORECASE)
+        if leading_like:
+            line_no, snippet = self._find_line(lines, re.compile(r"LIKE\s+['\"]%", re.IGNORECASE))
+            if not self._is_suppressed(lines, line_no - 1, 'SQL006'):
+                self.issues.append(Issue(
+                    id='SQL006',
+                    title='SQL LIKE Query with Leading Wildcard (%query)',
+                    description='A leading wildcard pattern like `LIKE "%keyword"` prevents the database engine from using B-Tree indexes, triggering a full table scan across all rows.',
+                    fix='Use trailing wildcard `LIKE "keyword%"` or implement Full-Text Search (FTS) / trigram indexing.',
+                    code_before='SELECT id, title FROM articles WHERE title LIKE "%performance%";',
+                    code_after='-- Use Full-Text index:\nSELECT id, title FROM articles WHERE MATCH(title) AGAINST(? IN NATURAL LANGUAGE MODE);',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Indexing & Search',
+                    severity=Severity.MEDIUM,
+                    layer=Layer.DATABASE,
+                    impact=7,
+                    effort=3,
+                    occurrences=1,
+                    perf_gain='Avoids full table scan on text searches'
+                ))

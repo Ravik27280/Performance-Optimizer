@@ -1,62 +1,122 @@
-import re, json
+import os
+import re
 from pathlib import Path
+from typing import List, Tuple
 from core.issue import Issue, Severity, Layer
 
 class AwsAnalyzer:
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = Path(path)
-        self.issues = []
+        self.issues: List[Issue] = []
 
-    def analyze(self):
-        for f in list(self.path.rglob('*.json')) + list(self.path.rglob('*.yml')) + list(self.path.rglob('*.yaml')):
-            if 'node_modules' in str(f): continue
-            try:
-                src = f.read_text(errors='ignore')
-                rel = str(f.relative_to(self.path))
-                self._check_aws_config(src, rel)
-            except: pass
+    def analyze(self) -> List[Issue]:
+        target_extensions = ['*.json', '*.yml', '*.yaml', '*.tf']
+        for ext in target_extensions:
+            for f in self.path.rglob(ext):
+                if any(x in str(f) for x in ['node_modules', 'dist/', '.git', 'package-lock.json']):
+                    continue
+                try:
+                    src = f.read_text(encoding='utf-8', errors='ignore')
+                    rel = str(f.relative_to(self.path)).replace('\\', '/')
+                    lines = src.splitlines()
+                    self._check_aws_config(src, lines, rel)
+                except Exception:
+                    pass
         return self.issues
 
-    def _check_aws_config(self, src, rel):
+    def _is_suppressed(self, lines: List[str], line_idx: int, rule_id: str) -> bool:
+        check_lines = []
+        if 0 <= line_idx < len(lines):
+            check_lines.append(lines[line_idx])
+        if 0 <= line_idx - 1 < len(lines):
+            check_lines.append(lines[line_idx - 1])
+        for cl in check_lines:
+            if f'perf-ignore {rule_id}' in cl or 'perf-ignore-all' in cl:
+                return True
+        return False
+
+    def _find_line(self, lines: List[str], regex_or_str) -> Tuple[int, str]:
+        for idx, line in enumerate(lines, 1):
+            if isinstance(regex_or_str, str) and regex_or_str.lower() in line.lower():
+                return idx, line.strip()
+            elif hasattr(regex_or_str, 'search') and regex_or_str.search(line):
+                return idx, line.strip()
+        return 1, (lines[0].strip() if lines else '')
+
+    def _check_aws_config(self, src: str, lines: List[str], rel: str):
         sl = src.lower()
-        # Lambda memory too low
-        mem_matches = re.findall(r'memorysize["\s:]+([0-9]+)', sl)
-        for m in mem_matches:
-            if int(m) < 512:
+
+        # AWS001: Lambda memory too low (<512MB)
+        mem_match = re.search(r'memorysize["\s:]+([0-9]+)', sl)
+        if mem_match:
+            val = int(mem_match.group(1))
+            if val < 512:
+                line_no, snippet = self._find_line(lines, re.compile(r'memorysize', re.IGNORECASE))
+                if not self._is_suppressed(lines, line_no - 1, 'AWS001'):
+                    self.issues.append(Issue(
+                        id='AWS001',
+                        title=f'Lambda Memory Allocated Too Low ({val} MB)',
+                        description=f'Lambda configured with only {val} MB memory. AWS CPU allocation scales proportionally with memory. Functions with <512MB memory suffer from throttled CPU, running 3-4x slower.',
+                        fix='Increase MemorySize to 512 MB - 1024 MB. Faster completion often results in equal or lower net AWS cost.',
+                        code_before=f'MemorySize: {val} # Under-allocated CPU',
+                        code_after='MemorySize: 512 # Full vCPU core access; up to 65% faster completion',
+                        file=rel,
+                        line_number=line_no,
+                        code_snippet=snippet,
+                        category='Serverless Latency',
+                        doc_url='https://docs.aws.amazon.com/lambda/latest/dg/configuration-function-common.html#configuration-memory-console',
+                        severity=Severity.HIGH,
+                        layer=Layer.INFRA,
+                        impact=7,
+                        effort=1,
+                        occurrences=1,
+                        perf_gain='Cuts function runtime duration by up to 60%'
+                    ))
+
+        # AWS002: Static assets served without CloudFront CDN
+        has_s3 = 's3' in sl and any(w in sl for w in ['website', 'static', 'hosting', 'bucket'])
+        has_cdn = 'cloudfront' in sl or 'distribution' in sl
+        if has_s3 and not has_cdn:
+            line_no, snippet = self._find_line(lines, 's3')
+            if not self._is_suppressed(lines, line_no - 1, 'AWS002'):
                 self.issues.append(Issue(
-                    id='AWS001', title=f'Lambda Memory Too Low ({m}MB)',
-                    description=f'Lambda configured with only {m}MB memory. Lambda CPU allocation scales linearly with memory. Low memory = slow CPU = slower execution = higher cost (duration x memory). 128MB Lambda can be 4x slower than 512MB for the same code.',
-                    fix='Increase Lambda memory to 512MB-1024MB. Use Lambda Power Tuning tool to find optimal setting.',
-                    code_before=f'MemorySize: {m}  # Slow CPU allocation',
-                    code_after='MemorySize: 512  # 4x more CPU, often same or lower cost due to faster execution',
-                    file=rel, severity=Severity.MEDIUM, layer=Layer.INFRA,
-                    impact=6, effort=1, occurrences=len(mem_matches),
-                    perf_gain='Can reduce Lambda duration by 50-75%, may reduce cost too'
+                    id='AWS002',
+                    title='Static S3 Hosting Without CloudFront Edge CDN',
+                    description='Frontend static assets are served directly from an S3 bucket in a single region. Distant global users experience 200-500ms latency on every asset download.',
+                    fix='Deploy an Amazon CloudFront distribution in front of S3 with gzip/brotli compression enabled.',
+                    code_before='# Assets served from single S3 bucket region\n# Global users: 300ms+ roundtrip',
+                    code_after='# CloudFront CDN distribution with edge caching\n# Global users: 15-30ms from local edge',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Edge & CDN',
+                    severity=Severity.HIGH,
+                    layer=Layer.INFRA,
+                    impact=8,
+                    effort=3,
+                    occurrences=1,
+                    perf_gain='Reduces static asset latency from ~350ms to 20ms globally'
                 ))
-                break
-        # No CloudFront / CDN
-        has_s3_website = 's3' in sl and ('website' in sl or 'static' in sl or 'hosting' in sl)
-        has_cloudfront = 'cloudfront' in sl or 'distribution' in sl
-        if has_s3_website and not has_cloudfront:
-            self.issues.append(Issue(
-                id='AWS002', title='Static Assets Served Without CDN (CloudFront)',
-                description='Frontend assets appear to be served directly from S3 without CloudFront. Every user request hits S3 in one region. Users far from that region experience high latency.',
-                fix='Add CloudFront distribution in front of S3. Enable gzip compression, set cache-control headers. Use S3 Transfer Acceleration if needed.',
-                code_before='# Static files served from S3 bucket directly\n# ap-southeast-1 users OK, eu-west users: 300ms+ latency',
-                code_after='# CloudFront CDN: 400+ edge locations worldwide\n# Same user in EU: 20-30ms latency from nearest edge',
-                file=rel, severity=Severity.HIGH, layer=Layer.INFRA,
-                impact=8, effort=4, occurrences=1,
-                perf_gain='Reduces static asset latency from 200-500ms to 10-30ms globally'
-            ))
-        # No timeout on Lambda
-        if 'timeout' not in sl and 'lambda' in sl:
-            self.issues.append(Issue(
-                id='AWS003', title='Lambda Functions Without Explicit Timeout',
-                description='Lambda functions without explicit timeout default to 3 seconds. If a downstream service (RDS, external API) hangs, Lambda retries and accumulates cost. Set explicit timeouts per function purpose.',
-                fix='Set Timeout explicitly per function. API handlers: 10-15s. Background jobs: 60-300s.',
-                code_before='# No Timeout set\n# Defaults to 3s - may timeout before RDS query completes',
-                code_after='Timeout: 15  # seconds\n# Match to expected operation duration + buffer',
-                file=rel, severity=Severity.MEDIUM, layer=Layer.INFRA,
-                impact=5, effort=1, occurrences=1,
-                perf_gain='Prevents unexpected timeouts and reduces retry-related cost spikes'
-            ))
+
+        # AWS005: Lambda directly connecting to RDS without RDS Proxy
+        if ('lambda' in sl or 'serverless' in sl) and ('rds' in sl or 'postgres' in sl or 'mysql' in sl) and 'proxy' not in sl:
+            line_no, snippet = self._find_line(lines, re.compile(r'(?:rds|postgres|mysql)', re.IGNORECASE))
+            if not self._is_suppressed(lines, line_no - 1, 'AWS005'):
+                self.issues.append(Issue(
+                    id='AWS005',
+                    title='Serverless Lambda Connecting to RDS Without RDS Proxy',
+                    description='Lambda functions executing concurrent requests spawn hundreds of unpooled database connections, quickly exhausting RDS connection limits and leading to connection refusal errors.',
+                    fix='Place an Amazon RDS Proxy between Lambda and RDS to pool and multiplex database connections.',
+                    code_before='DB_HOST: "my-rds-cluster.rds.amazonaws.com" # Direct unpooled connection',
+                    code_after='DB_HOST: "my-proxy.proxy-xxx.rds.amazonaws.com" # Multiplexed pool via RDS Proxy',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Connection Pooling',
+                    severity=Severity.HIGH,
+                    layer=Layer.INFRA,
+                    impact=9,
+                    effort=4,
+                    occurrences=1,
+                    perf_gain='Prevents database connection exhaustion during traffic bursts'
+                ))

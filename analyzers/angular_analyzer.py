@@ -1,221 +1,385 @@
-import os, re, json
+import os
+import re
 from pathlib import Path
+from typing import List, Tuple, Optional
 from core.issue import Issue, Severity, Layer
 
 class AngularAnalyzer:
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = Path(path)
-        self.issues = []
+        self.issues: List[Issue] = []
 
-    def analyze(self):
+    def analyze(self) -> List[Issue]:
         for f in self.path.rglob('*.ts'):
-            if any(x in str(f) for x in ['node_modules', '.spec.', 'dist/', '.d.ts']): continue
+            if any(x in str(f) for x in ['node_modules', '.spec.', 'dist/', '.d.ts', '.angular', '.git']):
+                continue
             try:
-                src = f.read_text(errors='ignore')
-                if '@Component' in src: self._check_component(src, f)
-                if 'subscribe(' in src: self._check_subscriptions(src, f)
-                if 'HttpClient' in src or 'http.get' in src.lower(): self._check_http(src, f)
-                self._check_imports(src, f)
-            except: pass
+                src = f.read_text(encoding='utf-8', errors='ignore')
+                rel = str(f.relative_to(self.path)).replace('\\', '/')
+                lines = src.splitlines()
+
+                if '@Component' in src:
+                    self._check_component(src, lines, rel)
+                if 'subscribe(' in src:
+                    self._check_subscriptions(src, lines, rel)
+                if 'HttpClient' in src or 'http.get' in src.lower() or 'this.http.' in src:
+                    self._check_http(src, lines, rel)
+                self._check_imports(src, lines, rel)
+            except Exception:
+                pass
+
         for f in self.path.rglob('*.html'):
-            if any(x in str(f) for x in ['node_modules', 'dist/']): continue
+            if any(x in str(f) for x in ['node_modules', 'dist/', '.angular', '.git']):
+                continue
             try:
-                src = f.read_text(errors='ignore')
-                self._check_template(src, f)
-            except: pass
+                src = f.read_text(encoding='utf-8', errors='ignore')
+                rel = str(f.relative_to(self.path)).replace('\\', '/')
+                lines = src.splitlines()
+                self._check_template(src, lines, rel)
+            except Exception:
+                pass
+
         for f in self.path.rglob('*-routing.module.ts'):
-            if 'node_modules' in str(f): continue
+            if any(x in str(f) for x in ['node_modules', 'dist/', '.angular', '.git']):
+                continue
             try:
-                src = f.read_text(errors='ignore')
-                self._check_routing(src, f)
-            except: pass
+                src = f.read_text(encoding='utf-8', errors='ignore')
+                rel = str(f.relative_to(self.path)).replace('\\', '/')
+                lines = src.splitlines()
+                self._check_routing(src, lines, rel)
+            except Exception:
+                pass
+
         return self.issues
 
-    def _check_component(self, src, f):
-        rel = str(f.relative_to(self.path))
-        # OnPush check
-        if '@Component' in src and 'ChangeDetectionStrategy.OnPush' not in src:
-            self.issues.append(Issue(
-                id='ANG001', title='Missing OnPush Change Detection',
-                description='Component uses Default change detection. Angular re-renders the ENTIRE component tree on every browser event (click, mousemove, keyup). With OnPush, re-renders only on @Input() reference change or async pipe emit.',
-                fix='Add changeDetection: ChangeDetectionStrategy.OnPush to @Component decorator. Also ensure inputs are immutable (use spread/Object.assign instead of mutation).',
-                code_before='@Component({ selector: \'app-x\', template: \'...\' })\nexport class XComponent {}',
-                code_after='@Component({\n  selector: \'app-x\',\n  template: \'...\',\n  changeDetection: ChangeDetectionStrategy.OnPush\n})\nexport class XComponent {}',
-                file=rel, severity=Severity.CRITICAL, layer=Layer.FRONTEND,
-                impact=9, effort=3, occurrences=1,
-                perf_gain='Up to 65% reduction in DOM re-renders for data-heavy UIs'
-            ))
-        # Large @Input arrays not using immutable pattern
-        if 'Input()' in src and '.push(' in src:
-            self.issues.append(Issue(
-                id='ANG002', title='Mutable Input Mutation (Breaks OnPush)',
-                description='Pushing to an @Input() array mutates the reference. OnPush will NOT detect this change, causing stale UI. Also causes unintended shared-state bugs.',
-                fix='Use immutable spread: this.items = [...this.items, newItem] instead of this.items.push(newItem)',
-                code_before='this.dataList.push(newItem); // OnPush won\'t detect',
-                code_after='this.dataList = [...this.dataList, newItem]; // new ref = OnPush detects',
-                file=rel, severity=Severity.HIGH, layer=Layer.FRONTEND,
-                impact=7, effort=2, occurrences=src.count('.push('),
-                perf_gain='Ensures change detection works correctly with OnPush'
-            ))
-        # ChangeDetectorRef.detectChanges in loops
-        if 'detectChanges()' in src and ('for(' in src or 'forEach' in src or 'for (' in src):
-            self.issues.append(Issue(
-                id='ANG003', title='detectChanges() Called Inside Loop',
-                description='Manually triggering change detection inside a loop causes N synchronous re-renders, freezing the browser UI thread.',
-                fix='Batch updates, call detectChanges() once after loop completes, or use markForCheck() instead.',
-                code_before='items.forEach(i => { this.process(i); this.cdr.detectChanges(); })',
-                code_after='items.forEach(i => this.process(i));\nthis.cdr.detectChanges(); // once after loop',
-                file=rel, severity=Severity.HIGH, layer=Layer.FRONTEND,
-                impact=8, effort=2, occurrences=1,
-                perf_gain='Eliminates N redundant render cycles per loop iteration'
-            ))
+    def _is_suppressed(self, lines: List[str], line_idx: int, rule_id: str) -> bool:
+        """Checks for // perf-ignore [RULE_ID] on current or previous line."""
+        check_lines = []
+        if 0 <= line_idx < len(lines):
+            check_lines.append(lines[line_idx])
+        if 0 <= line_idx - 1 < len(lines):
+            check_lines.append(lines[line_idx - 1])
+        for cl in check_lines:
+            if f'perf-ignore {rule_id}' in cl or 'perf-ignore-all' in cl:
+                return True
+        return False
 
-    def _check_subscriptions(self, src, f):
-        rel = str(f.relative_to(self.path))
-        sub_count = src.count('.subscribe(')
-        unsub_count = src.count('unsubscribe(') + src.count('takeUntil(') + src.count('async pipe') + src.count('| async')
-        if sub_count > 0 and unsub_count == 0 and '@Component' in src:
-            self.issues.append(Issue(
-                id='ANG004', title='Observable Memory Leak – No Unsubscribe',
-                description=f'Found {sub_count} subscribe() calls with no unsubscribe, takeUntil, or async pipe. Each subscription stays alive after component destroy, accumulates handlers, and can replay events on destroyed views causing ExpressionChangedAfterItHasBeenCheckedError.',
-                fix='Use takeUntil(this.destroy$) pattern with ngOnDestroy, or use the async pipe in templates to auto-unsubscribe.',
-                code_before='ngOnInit() {\n  this.service.data$.subscribe(d => this.data = d);\n  // Subscription leaks when component destroys\n}',
-                code_after='private destroy$ = new Subject<void>();\nngOnInit() {\n  this.service.data$.pipe(takeUntil(this.destroy$))\n    .subscribe(d => this.data = d);\n}\nngOnDestroy() { this.destroy$.next(); this.destroy$.complete(); }',
-                file=rel, severity=Severity.CRITICAL, layer=Layer.FRONTEND,
-                impact=8, effort=4, occurrences=sub_count,
-                perf_gain='Eliminates memory growth per navigation, prevents ghost event handlers'
-            ))
-        # Nested subscriptions
-        if 'subscribe(' in src:
-            lines = src.split('\n')
-            for i, line in enumerate(lines):
-                if '.subscribe(' in line:
-                    snippet = '\n'.join(lines[i:i+8])
-                    if '.subscribe(' in snippet[snippet.index('.subscribe(')+12:]:
+    def _find_line(self, lines: List[str], regex_or_str: str) -> Tuple[int, str]:
+        for idx, line in enumerate(lines, 1):
+            if isinstance(regex_or_str, str) and regex_or_str in line:
+                return idx, line.strip()
+            elif hasattr(regex_or_str, 'search') and regex_or_str.search(line):
+                return idx, line.strip()
+        return 1, (lines[0].strip() if lines else '')
+
+    def _check_component(self, src: str, lines: List[str], rel: str):
+        # ANG001: Missing OnPush Change Detection
+        if '@Component' in src and 'ChangeDetectionStrategy.OnPush' not in src:
+            line_no, snippet = self._find_line(lines, '@Component')
+            if not self._is_suppressed(lines, line_no - 1, 'ANG001'):
+                self.issues.append(Issue(
+                    id='ANG001',
+                    title='Missing OnPush Change Detection Strategy',
+                    description='Component uses default change detection. Angular dirty-checks the entire component subtree on every DOM event, timer, and HTTP response. OnPush restricts checks to @Input() reference changes or async pipe emissions.',
+                    fix='Add `changeDetection: ChangeDetectionStrategy.OnPush` to @Component decorator.',
+                    code_before='@Component({\n  selector: "app-feature",\n  templateUrl: "./feature.component.html"\n})\nexport class FeatureComponent {}',
+                    code_after='@Component({\n  selector: "app-feature",\n  templateUrl: "./feature.component.html",\n  changeDetection: ChangeDetectionStrategy.OnPush\n})\nexport class FeatureComponent {}',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='DOM Re-renders',
+                    doc_url='https://angular.dev/best-practices/runtime-performance#onpush-change-detection',
+                    severity=Severity.HIGH,
+                    layer=Layer.FRONTEND,
+                    impact=9,
+                    effort=3,
+                    occurrences=1,
+                    perf_gain='Up to 65% reduction in DOM re-renders for data-heavy UIs'
+                ))
+
+        # ANG002: Direct Input Mutation
+        input_props = re.findall(r'@Input\(\)\s+(?:public\s+|readonly\s+)?(\w+)', src)
+        for prop in input_props:
+            push_pattern = rf'this\.{prop}\.push\('
+            m = re.search(push_pattern, src)
+            if m:
+                line_no, snippet = self._find_line(lines, f'this.{prop}.push(')
+                if not self._is_suppressed(lines, line_no - 1, 'ANG002'):
+                    self.issues.append(Issue(
+                        id='ANG002',
+                        title=f'Direct Mutation of @Input Property `{prop}`',
+                        description=f'Mutating `this.{prop}.push(...)` alters internal state without changing object reference. With OnPush, Angular will fail to detect changes, leading to stale DOM updates.',
+                        fix=f'Use immutable array spreading: `this.{prop} = [...this.{prop}, item];`',
+                        code_before=f'this.{prop}.push(newItem); // Fails OnPush change detection',
+                        code_after=f'this.{prop} = [...this.{prop}, newItem]; // Emits new object reference',
+                        file=rel,
+                        line_number=line_no,
+                        code_snippet=snippet,
+                        category='Change Detection',
+                        doc_url='https://angular.dev/best-practices/runtime-performance',
+                        severity=Severity.HIGH,
+                        layer=Layer.FRONTEND,
+                        impact=7,
+                        effort=2,
+                        occurrences=1,
+                        perf_gain='Guarantees correct change propagation under OnPush'
+                    ))
+                    break
+
+        # ANG003: detectChanges inside loop
+        for idx, line in enumerate(lines, 1):
+            if 'detectChanges()' in line:
+                # Check previous 8 lines for loop declarations
+                prev_block = '\n'.join(lines[max(0, idx - 8):idx])
+                if any(loop_k in prev_block for loop_k in ['for (', 'for(', 'forEach(', '.map(']):
+                    if not self._is_suppressed(lines, idx - 1, 'ANG003'):
                         self.issues.append(Issue(
-                            id='ANG005', title='Nested subscribe() – Callback Hell',
-                            description='subscribe() inside subscribe() creates nested async callbacks. This causes race conditions, memory leaks, and blocks parallelism.',
-                            fix='Use switchMap, concatMap, or forkJoin to compose Observables instead of nesting.',
-                            code_before='.subscribe(id => {\n  this.service.getDetails(id).subscribe(d => ...)\n  // Race condition: old request may resolve after new one\n})',
-                            code_after='.pipe(\n  switchMap(id => this.service.getDetails(id))\n).subscribe(d => ...);',
-                            file=rel, severity=Severity.HIGH, layer=Layer.FRONTEND,
-                            impact=7, effort=5, occurrences=1,
-                            perf_gain='Eliminates race conditions, enables request cancellation'
+                            id='ANG003',
+                            title='detectChanges() Synchronously Called Inside Loop',
+                            description='Triggering change detection inside a loop forces synchronous DOM calculation on every single item iteration, locking the browser UI thread.',
+                            fix='Batch updates and call `markForCheck()` or trigger `detectChanges()` once after loop terminates.',
+                            code_before='items.forEach(item => {\n  this.updateItem(item);\n  this.cdr.detectChanges(); // N synchronous renders!\n});',
+                            code_after='items.forEach(item => this.updateItem(item));\nthis.cdr.markForCheck(); // Batched single cycle',
+                            file=rel,
+                            line_number=idx,
+                            code_snippet=line.strip(),
+                            category='Render Cycle',
+                            severity=Severity.CRITICAL,
+                            layer=Layer.FRONTEND,
+                            impact=8,
+                            effort=2,
+                            occurrences=1,
+                            perf_gain='Eliminates N redundant render cycles'
                         ))
                         break
 
-    def _check_http(self, src, f):
-        rel = str(f.relative_to(self.path))
-        # Fetch all data without pagination
-        has_get = 'http.get(' in src.lower() or '.get(' in src
-        has_pagination = any(x in src.lower() for x in ['page', 'limit', 'offset', 'pagesize', 'perpage', 'skip', 'take'])
-        has_search_subscribe = 'subscribe(' in src
-        if has_get and not has_pagination and has_search_subscribe:
-            self.issues.append(Issue(
-                id='ANG006', title='API Call Without Pagination – Fetching All Data',
-                description='HTTP GET call has no page/limit/offset parameters. This fetches the ENTIRE dataset from the server at once. As data grows, response time grows linearly, browser JS heap bloats, and Angular must render thousands of DOM nodes.',
-                fix='Add page/limit params to API call. Use Angular CDK Virtual Scroll (CdkVirtualScrollViewport) for the list. Implement server-side pagination in the backend.',
-                code_before='this.http.get<Item[]>(\'api/items\')\n  .subscribe(items => this.items = items);\n// Fetches ALL 50,000 items at once',
-                code_after='this.http.get<Page<Item>>(\'api/items\', {\n  params: { page: this.page, limit: 50 }\n}).subscribe(res => {\n  this.items = res.data;\n  this.total = res.total;\n});',
-                file=rel, severity=Severity.CRITICAL, layer=Layer.FRONTEND,
-                impact=10, effort=5, occurrences=src.lower().count('http.get(') + src.lower().count(".get('") + src.lower().count('.get(`'),
-                perf_gain='Reduces initial payload from MB to KB, cuts Time-to-Interactive by 70%+'
-            ))
-        # No debounce on user input
-        if ('fromEvent' in src or 'valueChanges' in src) and 'debounceTime' not in src:
-            self.issues.append(Issue(
-                id='ANG007', title='No debounceTime on User Input Stream',
-                description='Reactive form valueChanges or fromEvent fires an API call on EVERY keystroke. A user typing 10 chars fires 10 requests — most are wasted.',
-                fix='Add debounceTime(300) and distinctUntilChanged() to the pipe before the switchMap.',
-                code_before='this.searchControl.valueChanges\n  .pipe(switchMap(q => this.api.search(q)))\n  .subscribe(...);\n// Fires request on every keypress!',
-                code_after='this.searchControl.valueChanges.pipe(\n  debounceTime(300),\n  distinctUntilChanged(),\n  switchMap(q => this.api.search(q))\n).subscribe(...);',
-                file=rel, severity=Severity.HIGH, layer=Layer.FRONTEND,
-                impact=7, effort=1, occurrences=1,
-                perf_gain='Reduces API calls by ~85% for search/filter interactions'
-            ))
-        # No caching / repeated API calls
-        if src.count('http.get(') > 3 or src.count(".get('") > 3:
-            self.issues.append(Issue(
-                id='ANG008', title='No HTTP Response Caching (shareReplay Missing)',
-                description='Multiple components likely call the same endpoint repeatedly. Without caching, identical API calls are made on every component init.',
-                fix='Add shareReplay(1) to shared data streams in services. Use Angular HTTP interceptor for global cache-control.',
-                code_before='getData() {\n  return this.http.get(\'api/config\');\n  // Called 5x = 5 network requests\n}',
-                code_after='private cache$ = this.http.get(\'api/config\')\n  .pipe(shareReplay(1)); // cached\ngetData() { return this.cache$; }',
-                file=rel, severity=Severity.MEDIUM, layer=Layer.FRONTEND,
-                impact=6, effort=2, occurrences=1,
-                perf_gain='Eliminates redundant API calls for shared/static data'
-            ))
+    def _check_subscriptions(self, src: str, lines: List[str], rel: str):
+        # ANG004: Observable subscription leak
+        has_take_until = 'takeUntil(' in src or 'takeUntilDestroyed(' in src or 'take(1)' in src or 'first()' in src
+        if not has_take_until and '@Component' in src:
+            for idx, line in enumerate(lines, 1):
+                if '.subscribe(' in line and not self._is_suppressed(lines, idx - 1, 'ANG004'):
+                    self.issues.append(Issue(
+                        id='ANG004',
+                        title='Observable Subscription Memory Leak (Missing Teardown)',
+                        description='Subscription created without takeUntilDestroyed, take(1), or unsubscribe. Retains component instance and view DOM tree in memory after route navigation.',
+                        fix='Use Angular 16+ `takeUntilDestroyed(this.destroyRef)` or use the `| async` template pipe.',
+                        code_before='ngOnInit() {\n  this.service.data$.subscribe(d => this.data = d);\n}',
+                        code_after='private destroyRef = inject(DestroyRef);\n\nngOnInit() {\n  this.service.data$.pipe(\n    takeUntilDestroyed(this.destroyRef)\n  ).subscribe(d => this.data = d);\n}',
+                        file=rel,
+                        line_number=idx,
+                        code_snippet=line.strip(),
+                        category='Memory Leak',
+                        doc_url='https://angular.dev/guide/signals/rxjs-interop',
+                        severity=Severity.CRITICAL,
+                        layer=Layer.FRONTEND,
+                        impact=9,
+                        effort=3,
+                        occurrences=src.count('.subscribe('),
+                        perf_gain='Prevents progressive memory growth across route transitions'
+                    ))
+                    break
 
-    def _check_template(self, src, f):
-        rel = str(f.relative_to(self.path))
-        # ngFor without trackBy
-        ngfor_matches = re.findall(r'\*ngFor', src)
-        trackby_matches = re.findall(r'trackBy', src)
-        if len(ngfor_matches) > len(trackby_matches):
-            missing = len(ngfor_matches) - len(trackby_matches)
-            self.issues.append(Issue(
-                id='ANG009', title=f'*ngFor Without trackBy ({missing} occurrence(s))',
-                description=f'Found {len(ngfor_matches)} *ngFor directives, only {len(trackby_matches)} use trackBy. Without trackBy, Angular destroys and re-creates ALL DOM nodes on every data change — even when only 1 item changed. With 1000 rows, this means 1000 DOM operations per update.',
-                fix='Add trackBy function. For items with id: trackByFn(index, item) { return item.id; }',
-                code_before='<div *ngFor="let item of items">{{item.name}}</div>\n<!-- Destroys & recreates ALL nodes on update -->',
-                code_after='<div *ngFor="let item of items; trackBy: trackById">{{item.name}}</div>\n// In component: trackById = (i, item) => item.id;',
-                file=rel, severity=Severity.CRITICAL, layer=Layer.FRONTEND,
-                impact=8, effort=2, occurrences=missing,
-                perf_gain='Reduces DOM operations by up to 99% for list updates'
-            ))
-        # No virtual scroll for large lists
-        if '*ngFor' in src and 'cdk-virtual-scroll-viewport' not in src and 'virtual-scroll' not in src:
-            self.issues.append(Issue(
-                id='ANG010', title='No Virtual Scrolling for Large List',
-                description='List renders ALL items to DOM at once. If the list has 500+ items, Angular renders 500 DOM nodes — most invisible. Browser must layout and paint all of them.',
-                fix='Use Angular CDK CdkVirtualScrollViewport. Only renders visible items (~20), recycles DOM nodes as user scrolls.',
-                code_before='<div *ngFor="let item of items">\n  <!-- Renders ALL 5000 items -->\n</div>',
-                code_after='<cdk-virtual-scroll-viewport itemSize="50" style="height:500px">\n  <div *cdkVirtualFor="let item of items">\n    {{ item.name }}\n  </div>\n</cdk-virtual-scroll-viewport>',
-                file=rel, severity=Severity.HIGH, layer=Layer.FRONTEND,
-                impact=9, effort=4, occurrences=len(ngfor_matches),
-                perf_gain='Renders only ~20 DOM nodes regardless of list size — critical for large datasets'
-            ))
-        # Method calls in templates (performance anti-pattern)
-        method_calls = re.findall(r'{{\s*\w+\(', src)
-        if len(method_calls) > 2:
-            self.issues.append(Issue(
-                id='ANG011', title=f'Method Calls in Template ({len(method_calls)} found)',
-                description='Method calls in Angular templates are invoked on EVERY change detection cycle. A method called in a template with 100ms intervals = 600 method executions per minute. For expensive calculations this kills performance.',
-                fix='Use pure Pipes instead of methods, or pre-compute values in ngOnInit/ngOnChanges and bind to a property.',
-                code_before='<!-- Called on every change detection: -->\n<div>{{ formatDate(item.date) }}</div>\n<div>{{ calculateTotal(items) }}</div>',
-                code_after='<!-- Use pipe (cached): -->\n<div>{{ item.date | date:\'short\' }}</div>\n<!-- Or pre-compute: -->\n<div>{{ totalAmount }}</div> // set in ngOnChanges',
-                file=rel, severity=Severity.HIGH, layer=Layer.FRONTEND,
-                impact=7, effort=3, occurrences=len(method_calls),
-                perf_gain='Eliminates repeated expensive computations on every render cycle'
-            ))
+        # ANG005: Nested subscribe callback hell
+        for idx, line in enumerate(lines, 1):
+            if '.subscribe(' in line:
+                chunk = '\n'.join(lines[idx:min(len(lines), idx + 8)])
+                if '.subscribe(' in chunk:
+                    if not self._is_suppressed(lines, idx - 1, 'ANG005'):
+                        self.issues.append(Issue(
+                            id='ANG005',
+                            title='Nested subscribe() Callback Anti-pattern',
+                            description='Subscribing inside a subscribe handler causes race conditions, unhandled rejections, and disables automatic request cancellation.',
+                            fix='Flatten using RxJS higher-order mapping operators like `switchMap` or `concatMap`.',
+                            code_before='this.route.params.subscribe(p => {\n  this.api.getUser(p.id).subscribe(u => this.user = u);\n});',
+                            code_after='this.route.params.pipe(\n  switchMap(p => this.api.getUser(p.id))\n).subscribe(u => this.user = u);',
+                            file=rel,
+                            line_number=idx,
+                            code_snippet=line.strip(),
+                            category='Concurrency & Flow',
+                            severity=Severity.HIGH,
+                            layer=Layer.FRONTEND,
+                            impact=7,
+                            effort=3,
+                            occurrences=1,
+                            perf_gain='Eliminates race conditions and redundant network requests'
+                        ))
+                        break
 
-    def _check_imports(self, src, f):
-        rel = str(f.relative_to(self.path))
-        # Full module imports instead of specific
-        if 'import * from' in src or "from 'lodash'" in src or 'import _ from' in src:
-            self.issues.append(Issue(
-                id='ANG012', title='Wildcard / Full Library Import (Bundle Bloat)',
-                description='Importing entire lodash or using import * pulls the WHOLE library into your bundle even if you use 1 function. Lodash alone is 70KB+ minified.',
-                fix='Import only the specific function: import debounce from "lodash/debounce" instead of import _ from "lodash"',
-                code_before="import _ from 'lodash'; // 70KB added to bundle\n_.debounce(fn, 300);",
-                code_after="import debounce from 'lodash/debounce'; // ~2KB\ndebounce(fn, 300);",
-                file=rel, severity=Severity.MEDIUM, layer=Layer.FRONTEND,
-                impact=5, effort=2, occurrences=1,
-                perf_gain='Can reduce bundle size by 50-70KB+'
-            ))
+    def _check_http(self, src: str, lines: List[str], rel: str):
+        # ANG006: Unpaginated list fetch
+        has_get = 'http.get(' in src.lower() or 'this.http.get' in src.lower()
+        has_pagination = any(p in src.lower() for p in ['page', 'limit', 'offset', 'pagesize', 'skip', 'take'])
+        if has_get and not has_pagination and any(k in src.lower() for k in ['items', 'orders', 'users', 'list', 'all', 'records']):
+            line_no, snippet = self._find_line(lines, re.compile(r'http\.get', re.IGNORECASE))
+            if not self._is_suppressed(lines, line_no - 1, 'ANG006'):
+                self.issues.append(Issue(
+                    id='ANG006',
+                    title='Unpaginated HTTP Collection Request (Full Dataset Fetch)',
+                    description='HTTP GET fetches entire data collections without pagination parameters. As tables grow, payload size balloons from KB to tens of MBs, blocking client CPU.',
+                    fix='Add query parameters for page and limit; paginate on both server and client.',
+                    code_before='this.http.get<Order[]>("/api/orders").subscribe(data => this.orders = data);',
+                    code_after='this.http.get<Paged<Order>>("/api/orders", {\n  params: { page: this.page, limit: 25 }\n}).subscribe(res => this.orders = res.items);',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Network & Bundle',
+                    severity=Severity.CRITICAL,
+                    layer=Layer.FRONTEND,
+                    impact=10,
+                    effort=4,
+                    occurrences=1,
+                    perf_gain='Reduces payload by 80%+ and cuts Time-to-Interactive'
+                ))
 
-    def _check_routing(self, src, f):
-        rel = str(f.relative_to(self.path))
-        eager = re.findall(r'component:\s*\w+Component', src)
-        lazy = re.findall(r'loadChildren|loadComponent', src)
-        if len(eager) > 2 and len(lazy) == 0:
-            self.issues.append(Issue(
-                id='ANG013', title=f'No Lazy Loading – {len(eager)} Routes Eagerly Loaded',
-                description=f'All {len(eager)} routes load their modules at app startup. User pays the full JS parse+compile cost upfront even for pages they never visit. Initial bundle includes code for ALL features.',
-                fix='Use loadChildren with dynamic import for each route. Angular will code-split automatically.',
-                code_before="{ path: 'dashboard', component: DashboardComponent }\n// DashboardModule loaded at startup",
-                code_after="{ path: 'dashboard',\n  loadChildren: () => import('./dashboard/dashboard.module')\n    .then(m => m.DashboardModule) }\n// Loaded only when user visits /dashboard",
-                file=rel, severity=Severity.HIGH, layer=Layer.FRONTEND,
-                impact=8, effort=4, occurrences=len(eager),
-                perf_gain=f'Can reduce initial bundle by 40-60%. Splits into {len(eager)} separate chunks'
-            ))
+        # ANG007: No debounce on user input
+        if ('valueChanges' in src or 'fromEvent' in src) and 'debounceTime' not in src:
+            line_no, snippet = self._find_line(lines, 'valueChanges')
+            if line_no == 1:
+                line_no, snippet = self._find_line(lines, 'fromEvent')
+            if not self._is_suppressed(lines, line_no - 1, 'ANG007'):
+                self.issues.append(Issue(
+                    id='ANG007',
+                    title='Missing debounceTime on Reactive Form / Input Stream',
+                    description='Form `valueChanges` triggers downstream API requests or expensive filter calculations on every single keystroke.',
+                    fix='Add `debounceTime(300)` and `distinctUntilChanged()` into the pipe operator.',
+                    code_before='this.searchControl.valueChanges.pipe(\n  switchMap(q => this.api.search(q))\n).subscribe();',
+                    code_after='this.searchControl.valueChanges.pipe(\n  debounceTime(300),\n  distinctUntilChanged(),\n  switchMap(q => this.api.search(q))\n).subscribe();',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Network Optimization',
+                    severity=Severity.HIGH,
+                    layer=Layer.FRONTEND,
+                    impact=7,
+                    effort=1,
+                    occurrences=1,
+                    perf_gain='Cuts redundant network requests by up to 85%'
+                ))
+
+    def _check_template(self, src: str, lines: List[str], rel: str):
+        # ANG009: *ngFor without trackBy or @for without track
+        ngfor_matches = len(re.findall(r'\*ngFor', src))
+        trackby_matches = len(re.findall(r'trackBy', src))
+        for_without_track = re.findall(r'@for\s*\([^;)]+\)', src) # missing track
+
+        if ngfor_matches > trackby_matches:
+            line_no, snippet = self._find_line(lines, '*ngFor')
+            if not self._is_suppressed(lines, line_no - 1, 'ANG009'):
+                self.issues.append(Issue(
+                    id='ANG009',
+                    title=f'*ngFor Loop Missing trackBy Identifier ({ngfor_matches - trackby_matches} un-tracked)',
+                    description='Without trackBy, Angular destroys and recreates all DOM nodes in the list when data refreshes, causing UI stutter and input focus loss.',
+                    fix='Use modern Angular `@for (item of items; track item.id)` or add `trackBy: trackById`.',
+                    code_before='<div *ngFor="let item of items">{{ item.name }}</div>',
+                    code_after='@for (item of items; track item.id) {\n  <div>{{ item.name }}</div>\n}',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='DOM Performance',
+                    doc_url='https://angular.dev/guide/templates/control-flow#for-loop',
+                    severity=Severity.CRITICAL,
+                    layer=Layer.FRONTEND,
+                    impact=8,
+                    effort=1,
+                    occurrences=ngfor_matches - trackby_matches,
+                    perf_gain='Reduces DOM node re-creations by up to 99%'
+                ))
+
+        # ANG011: Method calls in template interpolation
+        method_calls = re.findall(r'{{\s*([a-zA-Z0-9_]+)\(', src)
+        if len(method_calls) >= 2:
+            line_no, snippet = self._find_line(lines, re.compile(r'{{\s*[a-zA-Z0-9_]+\('))
+            if not self._is_suppressed(lines, line_no - 1, 'ANG011'):
+                self.issues.append(Issue(
+                    id='ANG011',
+                    title=f'Method Calls in Template Interpolation ({len(method_calls)} detected)',
+                    description='Invoking methods in template bindings evaluates the method on every single change detection tick (hundreds of times per second during interactions).',
+                    fix='Replace method calls with pure Pipes or pre-computed signal/component properties.',
+                    code_before='<div>{{ formatPrice(item.price) }}</div> <!-- Runs every cycle -->',
+                    code_after='<div>{{ item.price | currency }}</div> <!-- Cached pure pipe -->',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='DOM Re-renders',
+                    severity=Severity.HIGH,
+                    layer=Layer.FRONTEND,
+                    impact=7,
+                    effort=2,
+                    occurrences=len(method_calls),
+                    perf_gain='Eliminates repeated execution of heavy template methods'
+                ))
+
+        # ANG014: Missing @defer for heavy components
+        if '<app-' in src and '@defer' not in src and len(re.findall(r'<app-[\w-]+', src)) >= 3:
+            line_no, snippet = self._find_line(lines, re.compile(r'<app-[\w-]+'))
+            if not self._is_suppressed(lines, line_no - 1, 'ANG014'):
+                self.issues.append(Issue(
+                    id='ANG014',
+                    title='Heavy Subcomponents Rendered Without @defer (Lazy Viewport)',
+                    description='Non-critical below-the-fold components are loaded synchronously in the initial bundle. Angular 17+ deferrable views delay JS download until visible.',
+                    fix='Wrap heavy below-the-fold components in `@defer (on viewport) { ... }`.',
+                    code_before='<app-heavy-chart [data]="chartData" />',
+                    code_after='@defer (on viewport) {\n  <app-heavy-chart [data]="chartData" />\n} @placeholder {\n  <div class="chart-skeleton">Loading chart...</div>\n}',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Network & Bundle',
+                    doc_url='https://angular.dev/guide/templates/defer',
+                    severity=Severity.MEDIUM,
+                    layer=Layer.FRONTEND,
+                    impact=7,
+                    effort=2,
+                    occurrences=1,
+                    perf_gain='Reduces initial JS chunk size and speeds up Largest Contentful Paint (LCP)'
+                ))
+
+    def _check_imports(self, src: str, lines: List[str], rel: str):
+        # ANG012: Full library wildcard imports
+        if 'import * as _' in src or "from 'lodash'" in src or "from 'rxjs/Rx'" in src:
+            line_no, snippet = self._find_line(lines, re.compile(r"(?:from 'lodash'|import \* as _|from 'rxjs/Rx')"))
+            if not self._is_suppressed(lines, line_no - 1, 'ANG012'):
+                self.issues.append(Issue(
+                    id='ANG012',
+                    title='Unoptimized Full Library Import (Bundle Bloat)',
+                    description='Importing entire libraries like `lodash` or legacy RxJS bundles disables tree-shaking and adds 70KB+ unnecessary JS to client downloads.',
+                    fix='Import individual functions: `import debounce from "lodash/debounce";` or use native JS.',
+                    code_before='import _ from "lodash";\n_.cloneDeep(data);',
+                    code_after='import cloneDeep from "lodash/cloneDeep";\ncloneDeep(data); // Or structuredClone(data)',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Bundle Optimization',
+                    severity=Severity.MEDIUM,
+                    layer=Layer.FRONTEND,
+                    impact=6,
+                    effort=2,
+                    occurrences=1,
+                    perf_gain='Saves 50KB-80KB in production bundle size'
+                ))
+
+    def _check_routing(self, src: str, lines: List[str], rel: str):
+        # ANG013: Eager routing without lazy loading
+        eager_routes = re.findall(r'component:\s*\w+Component', src)
+        lazy_routes = re.findall(r'loadChildren|loadComponent', src)
+        if len(eager_routes) >= 3 and len(lazy_routes) == 0:
+            line_no, snippet = self._find_line(lines, 'component:')
+            if not self._is_suppressed(lines, line_no - 1, 'ANG013'):
+                self.issues.append(Issue(
+                    id='ANG013',
+                    title=f'All {len(eager_routes)} Routes Loaded Eagerly at Startup',
+                    description='All application feature modules load on initial page visit. Users download, parse, and compile code for routes they may never navigate to.',
+                    fix='Convert route definitions to use `loadComponent` or `loadChildren` with dynamic `import()`.',
+                    code_before='{ path: "admin", component: AdminComponent }',
+                    code_after='{ path: "admin", loadComponent: () => import("./admin/admin.component").then(m => m.AdminComponent) }',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Bundle Optimization',
+                    severity=Severity.HIGH,
+                    layer=Layer.FRONTEND,
+                    impact=8,
+                    effort=3,
+                    occurrences=len(eager_routes),
+                    perf_gain='Cuts initial bundle by 40-60% via automatic code splitting'
+                ))

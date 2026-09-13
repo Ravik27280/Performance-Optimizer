@@ -29,6 +29,10 @@ class Issue:
     effort: int        # 1-10
     occurrences: int
     perf_gain: str
+    line_number: Optional[int] = None
+    code_snippet: Optional[str] = None
+    category: str = 'Performance'
+    doc_url: Optional[str] = None
 
     @property
     def priority_score(self) -> float:
@@ -38,7 +42,7 @@ class Issue:
     @property
     def severity_order(self) -> int:
         order = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, Severity.LOW: 3}
-        return order[self.severity]
+        return order.get(self.severity, 3)
 
     def to_dict(self) -> dict:
         return {
@@ -49,6 +53,10 @@ class Issue:
             'code_before': self.code_before,
             'code_after': self.code_after,
             'file': self.file,
+            'line_number': self.line_number,
+            'code_snippet': self.code_snippet,
+            'category': self.category,
+            'doc_url': self.doc_url,
             'severity': self.severity.value,
             'layer': self.layer.value,
             'impact': self.impact,

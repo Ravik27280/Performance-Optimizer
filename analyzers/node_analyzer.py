@@ -1,224 +1,306 @@
-import os, re
+import os
+import re
+import json
 from pathlib import Path
+from typing import List, Tuple
 from core.issue import Issue, Severity, Layer
 
 class NodeAnalyzer:
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = Path(path)
-        self.issues = []
+        self.issues: List[Issue] = []
 
-    def analyze(self):
+    def analyze(self) -> List[Issue]:
         for f in self.path.rglob('*.js'):
-            if any(x in str(f) for x in ['node_modules', 'dist/', '.min.js', 'test/', 'spec/']): continue
+            if any(x in str(f) for x in ['node_modules', 'dist/', '.min.js', 'test/', 'spec/', '.git']):
+                continue
             try:
-                src = f.read_text(errors='ignore')
-                rel = str(f.relative_to(self.path))
-                self._check_async_patterns(src, f, rel)
-                self._check_seneca(src, f, rel)
-                self._check_db_patterns(src, f, rel)
-                self._check_api_responses(src, f, rel)
-                self._check_memory(src, f, rel)
-            except: pass
+                src = f.read_text(encoding='utf-8', errors='ignore')
+                rel = str(f.relative_to(self.path)).replace('\\', '/')
+                lines = src.splitlines()
+
+                self._check_async_patterns(src, lines, rel)
+                self._check_seneca(src, lines, rel)
+                self._check_db_patterns(src, lines, rel)
+                self._check_api_responses(src, lines, rel)
+                self._check_memory_and_events(src, lines, rel)
+                self._check_network(src, lines, rel)
+            except Exception:
+                pass
+
         for f in self.path.rglob('*.json'):
-            if any(x in str(f) for x in ['node_modules', 'dist/']): continue
+            if any(x in str(f) for x in ['node_modules', 'dist/', '.git']):
+                continue
             name = f.name.lower()
-            if name in ['db.config.json', 'database.json'] or 'config' in name:
+            if 'config' in name or 'database' in name or 'db' in name:
                 try:
-                    src = f.read_text(errors='ignore')
-                    rel = str(f.relative_to(self.path))
-                    self._check_db_config(src, f, rel)
-                except: pass
+                    src = f.read_text(encoding='utf-8', errors='ignore')
+                    rel = str(f.relative_to(self.path)).replace('\\', '/')
+                    lines = src.splitlines()
+                    self._check_db_config(src, lines, rel)
+                except Exception:
+                    pass
+
         return self.issues
 
-    def _check_async_patterns(self, src, f, rel):
-        # Sync fs in hot paths
-        sync_fs = re.findall(r'fs\.read(?:File|dir)Sync|fs\.write(?:File)?Sync|fs\.existsSync', src)
-        if sync_fs:
-            self.issues.append(Issue(
-                id='NODE001', title=f'Synchronous fs Call in Server Code ({len(sync_fs)} found)',
-                description=f'Found {len(sync_fs)} synchronous filesystem calls: {list(set(sync_fs[:3]))}. Sync fs calls BLOCK the entire Node.js event loop. Every concurrent request waits until the disk I/O completes. Under load, this serializes all traffic.',
-                fix='Replace with async fs.promises.readFile / fs.promises.writeFile or use streams.',
-                code_before='const data = fs.readFileSync(\'config.json\', \'utf8\');\n// BLOCKS: all requests wait for disk I/O',
-                code_after='const data = await fs.promises.readFile(\'config.json\', \'utf8\');\n// Non-blocking: event loop continues serving other requests',
-                file=rel, severity=Severity.HIGH, layer=Layer.BACKEND,
-                impact=8, effort=3, occurrences=len(sync_fs),
-                perf_gain='Unblocks event loop, allows Node to serve concurrent requests during I/O'
-            ))
-        # Missing Promise.all for independent async calls
-        lines = src.split('\n')
-        sequential_awaits = []
-        for i in range(len(lines)-1):
-            if re.search(r'await\s+\w+', lines[i]) and re.search(r'await\s+\w+', lines[i+1]):
-                # Check if they seem independent (no variable from line i used in line i+1)
-                m1 = re.search(r'const (\w+)\s*=\s*await', lines[i])
-                if m1:
-                    varname = m1.group(1)
-                    if varname not in lines[i+1]:
-                        sequential_awaits.append(i+1)
-        if len(sequential_awaits) >= 2:
-            self.issues.append(Issue(
-                id='NODE002', title='Sequential await for Independent Promises',
-                description=f'Found {len(sequential_awaits)} places with back-to-back awaits on independent operations. These run one-at-a-time adding latencies together. If op1=200ms and op2=150ms, sequential=350ms. Parallel=200ms.',
-                fix='Use Promise.all() to run independent async operations in parallel.',
-                code_before='const user = await getUser(id);      // 200ms\nconst config = await getConfig();    // 150ms\n// Total: 350ms (sequential)',
-                code_after='const [user, config] = await Promise.all([\n  getUser(id),      // \\\n  getConfig()       //  > 200ms (parallel)\n]);               // /',
-                file=rel, severity=Severity.HIGH, layer=Layer.BACKEND,
-                impact=7, effort=3, occurrences=len(sequential_awaits),
-                perf_gain=f'Reduces latency of independent async operations by up to 50%'
-            ))
-        # Unhandled promise rejections
-        then_count = src.count('.then(')
-        catch_count = src.count('.catch(')
-        if then_count > 0 and catch_count < then_count // 2:
-            self.issues.append(Issue(
-                id='NODE003', title='Promise Chains Without .catch() (Unhandled Rejections)',
-                description=f'Found {then_count} .then() chains but only {catch_count} .catch() handlers. Unhandled promise rejections crash Node.js processes in newer versions and cause silent failures in older ones.',
-                fix='Add .catch() to every promise chain or use try/catch with async/await.',
-                code_before='fetchData().then(d => process(d));\n// If fetchData rejects: UnhandledPromiseRejectionWarning',
-                code_after='try {\n  const d = await fetchData();\n  process(d);\n} catch (err) {\n  logger.error(err); // handle gracefully\n}',
-                file=rel, severity=Severity.MEDIUM, layer=Layer.BACKEND,
-                impact=6, effort=3, occurrences=then_count - catch_count,
-                perf_gain='Prevents silent failures and process crashes under load'
-            ))
+    def _is_suppressed(self, lines: List[str], line_idx: int, rule_id: str) -> bool:
+        check_lines = []
+        if 0 <= line_idx < len(lines):
+            check_lines.append(lines[line_idx])
+        if 0 <= line_idx - 1 < len(lines):
+            check_lines.append(lines[line_idx - 1])
+        for cl in check_lines:
+            if f'perf-ignore {rule_id}' in cl or 'perf-ignore-all' in cl:
+                return True
+        return False
 
-    def _check_seneca(self, src, f, rel):
-        if 'seneca' not in src.lower() and 'seneca' not in rel.lower(): return
-        # seneca.act inside loop
-        if ('seneca.act(' in src or '.act(' in src) and ('for(' in src or 'forEach' in src or 'for (' in src):
-            self.issues.append(Issue(
-                id='SEN001', title='Seneca .act() Called Inside Loop',
-                description='Calling seneca.act() inside a for/forEach loop fires N sequential microservice calls. Each waits for the previous. For N=100 items with 10ms latency each = 1 second blocked.',
-                fix='Batch items and send as a single act, or use Promise.all to parallelize act calls.',
-                code_before='for (const item of items) {\n  await seneca.act(\'role:inventory,cmd:update\', { item });\n  // N sequential microservice calls\n}',
-                code_after='// Option 1: Batch\nawait seneca.act(\'role:inventory,cmd:updateBatch\', { items });\n// Option 2: Parallel\nawait Promise.all(items.map(item =>\n  seneca.act(\'role:inventory,cmd:update\', { item })\n));',
-                file=rel, severity=Severity.CRITICAL, layer=Layer.BACKEND,
-                impact=9, effort=4, occurrences=1,
-                perf_gain='Reduces N×latency to max(latency) for batch operations'
-            ))
-        # Missing timeout on seneca act
-        if '.act(' in src and 'timeout' not in src.lower():
-            self.issues.append(Issue(
-                id='SEN002', title='Seneca .act() Without Timeout',
-                description='Seneca act calls without timeout will hang indefinitely if the target plugin is slow or dead. This blocks the calling request handler, exhausting the thread pool.',
-                fix='Set timeout in seneca.act options or configure global timeout: seneca({ timeout: 5000 })',
-                code_before='seneca.act(\'role:payment,cmd:charge\', data, cb);\n// Hangs forever if payment service is slow',
-                code_after='seneca.act(\'role:payment,cmd:charge\', data,\n  { timeout$: 5000 }, // 5s max\n  cb\n);',
-                file=rel, severity=Severity.HIGH, layer=Layer.BACKEND,
-                impact=7, effort=2, occurrences=src.count('.act('),
-                perf_gain='Prevents cascading timeouts from hanging the entire request pipeline'
-            ))
+    def _find_line(self, lines: List[str], regex_or_str) -> Tuple[int, str]:
+        for idx, line in enumerate(lines, 1):
+            if isinstance(regex_or_str, str) and regex_or_str in line:
+                return idx, line.strip()
+            elif hasattr(regex_or_str, 'search') and regex_or_str.search(line):
+                return idx, line.strip()
+        return 1, (lines[0].strip() if lines else '')
 
-    def _check_db_patterns(self, src, f, rel):
-        # N+1 query pattern: query inside loop
-        lines = src.split('\n')
-        in_loop = False
-        loop_depth = 0
-        query_in_loop = 0
-        for line in lines:
-            if re.search(r'\bfor\s*\(|\bforEach\b|\bfor\s+\(.*of\b|\bmap\s*\(', line):
-                in_loop = True
-                loop_depth += 1
-            if in_loop and re.search(r'\.query\s*\(|\.execute\s*\(|\.find\s*\(|\.findOne\s*\(|\.select\s*\(|db\.\w+', line):
-                query_in_loop += 1
-            if line.count('{') != line.count('}'):
-                pass
-            if re.search(r'^\s*}\s*[;,]?\s*$', line) and in_loop:
-                loop_depth = max(0, loop_depth - 1)
-                if loop_depth == 0: in_loop = False
-        if query_in_loop > 0:
-            self.issues.append(Issue(
-                id='NODE004', title=f'N+1 Database Query Pattern ({query_in_loop} occurrence(s))',
-                description=f'Detected {query_in_loop} database query call(s) inside iteration loops. This is the classic N+1 problem: 1 query to get N records, then N queries for each record\'s details. At N=100 rows with 5ms/query = 505ms. At N=1000 = 5005ms.',
-                fix='Use JOIN queries or IN clauses to fetch related data in a single query. Use ORM eager loading (include/populate).',
-                code_before='const orders = await db.query(\'SELECT * FROM orders\');\nfor (const order of orders) {\n  order.user = await db.query(\n    \'SELECT * FROM users WHERE id = ?\', [order.user_id]\n  ); // N extra queries!\n}',
-                code_after='const orders = await db.query(`\n  SELECT o.*, u.name, u.email\n  FROM orders o\n  JOIN users u ON u.id = o.user_id\n`); // 1 query total',
-                file=rel, severity=Severity.CRITICAL, layer=Layer.BACKEND,
-                impact=10, effort=4, occurrences=query_in_loop,
-                perf_gain='Reduces DB load from O(N) queries to O(1) per request'
-            ))
-        # No pagination in API return
-        if ('SELECT *' in src or 'find({})' in src or 'findAll()' in src) and 'LIMIT' not in src and 'limit' not in src:
-            self.issues.append(Issue(
-                id='NODE005', title='Database Query Returns All Rows (No LIMIT)',
-                description='Query fetches ALL rows with no LIMIT clause. As table grows, response time grows proportionally. A 1M row table will return all 1M rows, bloating memory and response payload.',
-                fix='Always add LIMIT/OFFSET or cursor-based pagination. Return paginated metadata (total, page, limit) in response.',
-                code_before="const users = await db.query('SELECT * FROM users');\n// Returns ALL rows always",
-                code_after="const { page = 1, limit = 50 } = req.query;\nconst offset = (page - 1) * limit;\nconst users = await db.query(\n  'SELECT * FROM users LIMIT ? OFFSET ?',\n  [limit, offset]\n);",
-                file=rel, severity=Severity.CRITICAL, layer=Layer.BACKEND,
-                impact=10, effort=3, occurrences=1,
-                perf_gain='Limits response to fixed size regardless of table growth'
-            ))
-        # No caching for repeated queries
-        if src.count('.query(') > 4 or src.count('.find(') > 4:
-            self.issues.append(Issue(
-                id='NODE006', title='No Caching Layer for Repeated DB Queries',
-                description='Multiple DB queries detected with no caching (Redis/Memcached). Identical queries for static/slow-changing data hit the DB every time.',
-                fix='Add Redis cache with TTL for frequently-read, rarely-changed data. Use node-cache for in-process caching.',
-                code_before='async getConfig() {\n  return await db.query(\'SELECT * FROM config\');\n  // Hits DB on every request\n}',
-                code_after='async getConfig() {\n  const cached = await redis.get(\'config\');\n  if (cached) return JSON.parse(cached);\n  const data = await db.query(\'SELECT * FROM config\');\n  await redis.setex(\'config\', 300, JSON.stringify(data));\n  return data;\n}',
-                file=rel, severity=Severity.HIGH, layer=Layer.BACKEND,
-                impact=8, effort=5, occurrences=1,
-                perf_gain='Eliminates DB hits for cacheable data, reduces DB load by 60-90%'
-            ))
-
-    def _check_api_responses(self, src, f, rel):
-        # Sending entire object without field selection
-        if ('res.json(' in src or 'res.send(' in src) and 'SELECT *' in src:
-            self.issues.append(Issue(
-                id='NODE007', title='API Returns Full DB Row (Over-fetching)',
-                description='API response includes all database columns including sensitive/unused fields. Increases payload size, wastes bandwidth, and leaks internal schema to clients.',
-                fix='Select only needed columns in SQL. Use a DTO/serializer to shape API responses explicitly.',
-                code_before="const user = await db.query('SELECT * FROM users WHERE id = ?', [id]);\nres.json(user); // sends password_hash, internal_id, audit_fields...",
-                code_after="const user = await db.query(\n  'SELECT id, name, email, avatar FROM users WHERE id = ?', [id]\n);\nres.json(user); // only what client needs",
-                file=rel, severity=Severity.MEDIUM, layer=Layer.BACKEND,
-                impact=5, effort=2, occurrences=1,
-                perf_gain='Reduces response payload size, faster JSON serialization'
-            ))
-        # No compression middleware
-        if 'express' in src and 'compress' not in src and 'gzip' not in src:
-            self.issues.append(Issue(
-                id='NODE008', title='No Response Compression (gzip/brotli)',
-                description='Express server has no compression middleware. JSON API responses sent uncompressed. A 200KB JSON payload compresses to ~20KB with gzip (90% reduction).',
-                fix='Add compression middleware: npm install compression, then app.use(compression())',
-                code_before="const app = express();\n// No compression\napp.use(router);",
-                code_after="const compression = require('compression');\napp.use(compression()); // auto gzip/deflate\napp.use(router);",
-                file=rel, severity=Severity.MEDIUM, layer=Layer.BACKEND,
-                impact=6, effort=1, occurrences=1,
-                perf_gain='Reduces API response sizes by 70-90%, faster network transfer'
-            ))
-
-    def _check_memory(self, src, f, rel):
-        # Large in-memory arrays grown without bound
-        if re.search(r'let\s+\w+\s*=\s*\[\]', src) and '.push(' in src and 'splice' not in src and 'shift' not in src:
-            pushes = src.count('.push(')
-            if pushes > 5:
-                self.issues.append(Issue(
-                    id='NODE009', title='Unbounded In-Memory Array Growth',
-                    description=f'Found array that grows via {pushes} .push() calls with no cleanup (splice/shift/slice). In a long-running server, this leaks memory indefinitely.',
-                    fix='Cap the array size, use a circular buffer, or stream data instead of accumulating.',
-                    code_before='let events = [];\nsetInterval(() => {\n  events.push(getEvent()); // grows forever\n}, 100);',
-                    code_after='const MAX = 1000;\nlet events = [];\nsetInterval(() => {\n  events.push(getEvent());\n  if (events.length > MAX) events.shift(); // cap size\n}, 100);',
-                    file=rel, severity=Severity.HIGH, layer=Layer.BACKEND,
-                    impact=7, effort=2, occurrences=pushes,
-                    perf_gain='Prevents memory growth causing GC pressure and eventual OOM'
-                ))
-    
-    def _check_db_config(self, src, f, rel):
-        try:
-            import json
-            config = json.loads(src)
-            pool = config.get('pool', config.get('database', {}).get('pool', {}))
-            if isinstance(pool, dict):
-                max_val = pool.get('max', pool.get('maximum', None))
-                if max_val is not None and int(max_val) < 5:
+    def _check_async_patterns(self, src: str, lines: List[str], rel: str):
+        # NODE001: Sync fs calls inside request handlers or functions
+        # Distinguish top-level boot calls vs inside functions
+        in_fn = False
+        for idx, line in enumerate(lines, 1):
+            if any(k in line for k in ['function', '=>', 'async', 'class']):
+                in_fn = True
+            if in_fn and any(sync_call in line for sync_call in ['fs.readFileSync', 'fs.writeFileSync', 'fs.readdirSync']):
+                if not self._is_suppressed(lines, idx - 1, 'NODE001'):
                     self.issues.append(Issue(
-                        id='NODE010', title=f'RDS Connection Pool Too Small (max={max_val})',
-                        description=f'Database connection pool max={max_val}. Under concurrent load, requests queue waiting for a connection. Each queued request adds latency equal to the wait time. For production, pool should be 10-20.',
-                        fix='Increase pool.max to 10-20 based on RDS instance size. Formula: pool_size = (core_count * 2) + spindle_count',
-                        code_before=f'pool: {{ max: {max_val}, min: 0 }}\n// Only {max_val} concurrent DB operations',
-                        code_after='pool: { max: 15, min: 2, acquire: 30000, idle: 10000 }\n// 15 concurrent DB connections',
-                        file=rel, severity=Severity.HIGH, layer=Layer.BACKEND,
-                        impact=8, effort=1, occurrences=1,
-                        perf_gain='Eliminates connection queue wait time under concurrent load'
+                        id='NODE001',
+                        title='Synchronous fs Call in Runtime Execution Path',
+                        description='Calling synchronous filesystem methods (readFileSync / writeFileSync) inside functions blocks the Node.js event loop. All concurrent requests wait until disk I/O completes.',
+                        fix='Switch to non-blocking `fs.promises.readFile` with `await` or use streams.',
+                        code_before='const raw = fs.readFileSync(filePath, "utf8"); // Blocks event loop',
+                        code_after='const raw = await fs.promises.readFile(filePath, "utf8"); // Non-blocking',
+                        file=rel,
+                        line_number=idx,
+                        code_snippet=line.strip(),
+                        category='Event Loop & Concurrency',
+                        severity=Severity.HIGH,
+                        layer=Layer.BACKEND,
+                        impact=8,
+                        effort=2,
+                        occurrences=1,
+                        perf_gain='Unblocks Node.js event loop for concurrent traffic'
                     ))
-        except: pass
+                    break
+
+        # NODE002: Sequential await for independent promises
+        for i in range(len(lines) - 1):
+            line_a = lines[i]
+            line_b = lines[i + 1]
+            if re.search(r'const\s+(\w+)\s*=\s*await\s+\w+', line_a) and re.search(r'const\s+(\w+)\s*=\s*await\s+\w+', line_b):
+                var_a = re.search(r'const\s+(\w+)', line_a).group(1)
+                # If line_b does not reference var_a, they are likely independent
+                if var_a not in line_b:
+                    if not self._is_suppressed(lines, i, 'NODE002'):
+                        self.issues.append(Issue(
+                            id='NODE002',
+                            title='Sequential await on Independent Operations',
+                            description='Consecutive awaits run sequentially, accumulating latency (e.g. 200ms + 150ms = 350ms). Running them concurrently reduces total latency to the slowest operation.',
+                            fix='Parallelize using `Promise.all([op1(), op2()])`.',
+                            code_before='const user = await getUser(userId);\nconst config = await getAppConfig(); // Waits for user!',
+                            code_after='const [user, config] = await Promise.all([\n  getUser(userId),\n  getAppConfig()\n]); // Runs in parallel',
+                            file=rel,
+                            line_number=i + 1,
+                            code_snippet=f"{line_a.strip()} \\n {line_b.strip()}",
+                            category='Latency & Parallelism',
+                            severity=Severity.HIGH,
+                            layer=Layer.BACKEND,
+                            impact=7,
+                            effort=2,
+                            occurrences=1,
+                            perf_gain='Reduces aggregate async operation latency by up to 50%'
+                        ))
+                        break
+
+    def _check_seneca(self, src: str, lines: List[str], rel: str):
+        if 'seneca' not in src.lower() and 'seneca' not in rel.lower():
+            return
+
+        # SEN001: seneca.act inside loop
+        for idx, line in enumerate(lines, 1):
+            if ('.act(' in line or 'seneca.act' in line):
+                prev_block = '\n'.join(lines[max(0, idx - 8):idx])
+                if any(loop_k in prev_block for loop_k in ['for (', 'for(', 'forEach(', 'for await']):
+                    if not self._is_suppressed(lines, idx - 1, 'SEN001'):
+                        self.issues.append(Issue(
+                            id='SEN001',
+                            title='Seneca .act() Called Inside Loop (Sequential RPC)',
+                            description='Firing microservice .act() calls inside a loop sequentially serializes network RPCs. 50 items at 20ms each = 1,000ms latency.',
+                            fix='Batch commands into a single message (`cmd:batchUpdate`) or parallelize via `Promise.all`.',
+                            code_before='for (const item of items) {\n  await seneca.act({ role: "store", cmd: "update", item });\n}',
+                            code_after='await seneca.act({ role: "store", cmd: "batchUpdate", items });',
+                            file=rel,
+                            line_number=idx,
+                            code_snippet=line.strip(),
+                            category='Microservice RPC',
+                            severity=Severity.CRITICAL,
+                            layer=Layer.BACKEND,
+                            impact=9,
+                            effort=4,
+                            occurrences=1,
+                            perf_gain='Reduces N×latency to max(latency) for batch operations'
+                        ))
+                        break
+
+    def _check_db_patterns(self, src: str, lines: List[str], rel: str):
+        # NODE004: N+1 Database queries inside loop
+        for idx, line in enumerate(lines, 1):
+            if any(q in line for q in ['.query(', '.execute(', '.find(', '.findOne(', 'db.']):
+                prev_chunk = '\n'.join(lines[max(0, idx - 8):idx])
+                if any(loop_kw in prev_chunk for loop_kw in ['for (', 'for(', 'forEach(', '.map(', 'for await']):
+                    if not self._is_suppressed(lines, idx - 1, 'NODE004'):
+                        self.issues.append(Issue(
+                            id='NODE004',
+                            title='N+1 Database Query Pattern in Loop',
+                            description='Database query executed inside iteration loop. Triggers 1 + N network roundtrips to the database, exhausting connection pools and causing massive latency spikes under load.',
+                            fix='Use a single SQL `JOIN` query or `WHERE id IN (...)` to retrieve all related records at once.',
+                            code_before='for (const order of orders) {\n  order.user = await db.query("SELECT * FROM users WHERE id = ?", [order.userId]);\n}',
+                            code_after='// Single JOIN query\nconst orders = await db.query(`\n  SELECT o.*, u.name, u.email FROM orders o\n  JOIN users u ON u.id = o.user_id\n`);',
+                            file=rel,
+                            line_number=idx,
+                            code_snippet=line.strip(),
+                            category='Database I/O',
+                            severity=Severity.CRITICAL,
+                            layer=Layer.BACKEND,
+                            impact=10,
+                            effort=3,
+                            occurrences=1,
+                            perf_gain='Replaces O(N) database queries with O(1)'
+                        ))
+                        break
+
+        # NODE005: Unpaginated DB query
+        if ('SELECT *' in src or 'find({})' in src or 'findAll()' in src) and 'LIMIT' not in src and 'limit' not in src:
+            line_no, snippet = self._find_line(lines, re.compile(r'(?:SELECT\s+\*|find\(\{\}\)|findAll\(\))'))
+            if not self._is_suppressed(lines, line_no - 1, 'NODE005'):
+                self.issues.append(Issue(
+                    id='NODE005',
+                    title='Database Query Returns All Rows (No LIMIT / Pagination)',
+                    description='Query lacks a LIMIT clause. On production datasets with tens of thousands of rows, this exhausts memory, locks DB cursors, and transmits massive payloads.',
+                    fix='Add LIMIT and OFFSET or cursor-based pagination to the query.',
+                    code_before='const users = await db.query("SELECT * FROM users");',
+                    code_after='const users = await db.query("SELECT * FROM users LIMIT ? OFFSET ?", [limit, offset]);',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Database I/O',
+                    severity=Severity.CRITICAL,
+                    layer=Layer.BACKEND,
+                    impact=10,
+                    effort=2,
+                    occurrences=1,
+                    perf_gain='Caps query memory and network transfer to predictable bounds'
+                ))
+
+    def _check_api_responses(self, src: str, lines: List[str], rel: str):
+        # NODE008: Missing compression middleware in Express
+        if 'express' in src and 'compression' not in src and ('listen(' in src or 'app.use' in src):
+            line_no, snippet = self._find_line(lines, re.compile(r'express\(\)'))
+            if not self._is_suppressed(lines, line_no - 1, 'NODE008'):
+                self.issues.append(Issue(
+                    id='NODE008',
+                    title='Express Server Missing Gzip/Brotli Response Compression',
+                    description='HTTP JSON responses are sent uncompressed. Modern gzip or brotli compression reduces JSON payload sizes by 70% to 90%, speeding up API response times on mobile and slow networks.',
+                    fix='Add `app.use(compression());` with the `compression` middleware.',
+                    code_before='const app = express();\napp.use(routes);',
+                    code_after='const compression = require("compression");\nconst app = express();\napp.use(compression());\napp.use(routes);',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Network Optimization',
+                    severity=Severity.MEDIUM,
+                    layer=Layer.BACKEND,
+                    impact=6,
+                    effort=1,
+                    occurrences=1,
+                    perf_gain='Reduces network payload sizes by 70-90%'
+                ))
+
+    def _check_memory_and_events(self, src: str, lines: List[str], rel: str):
+        # NODE011: EventEmitter leak (on without removeListener/off)
+        on_count = len(re.findall(r'\.on\(', src))
+        off_count = len(re.findall(r'\.(?:off|removeListener|removeAllListeners)\(', src))
+        if on_count >= 3 and off_count == 0 and ('emitter' in src.lower() or 'event' in src.lower()):
+            line_no, snippet = self._find_line(lines, '.on(')
+            if not self._is_suppressed(lines, line_no - 1, 'NODE011'):
+                self.issues.append(Issue(
+                    id='NODE011',
+                    title='Potential EventEmitter Memory Leak (Missing Listener Teardown)',
+                    description=f'Found {on_count} `.on(...)` listener registrations with no corresponding `.off()` or `.removeListener()`. Retains closures and objects in memory across request lifecycles.',
+                    fix='Ensure event listeners are cleaned up or use `events.once()` for one-time events.',
+                    code_before='emitter.on("data", handler); // Listener never removed',
+                    code_after='emitter.once("data", handler); // Or emitter.off("data", handler) in cleanup',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Memory Leak',
+                    severity=Severity.HIGH,
+                    layer=Layer.BACKEND,
+                    impact=7,
+                    effort=2,
+                    occurrences=on_count,
+                    perf_gain='Eliminates progressive heap memory growth in long-running processes'
+                ))
+
+    def _check_network(self, src: str, lines: List[str], rel: str):
+        # NODE012: Missing HTTP keep-alive for microservice/API clients
+        if ('axios' in src or 'fetch(' in src or 'http.request' in src) and 'keepAlive' not in src and 'Agent' not in src:
+            line_no, snippet = self._find_line(lines, re.compile(r'(?:axios|http\.request)'))
+            if line_no > 0 and not self._is_suppressed(lines, line_no - 1, 'NODE012'):
+                self.issues.append(Issue(
+                    id='NODE012',
+                    title='HTTP Requests Without Connection Reuse (Missing keepAlive: true)',
+                    description='Outgoing HTTP requests create a new TCP + TLS handshake for every call. Enabling HTTP keep-alive reuses existing TCP sockets, eliminating 50-100ms connection overhead per RPC.',
+                    fix='Configure `http.Agent({ keepAlive: true })` or pass `{ keepAlive: true }` to your HTTP client.',
+                    code_before='const agent = new http.Agent(); // Default keepAlive: false',
+                    code_after='const agent = new http.Agent({ keepAlive: true, maxSockets: 50 });',
+                    file=rel,
+                    line_number=line_no,
+                    code_snippet=snippet,
+                    category='Latency & Network',
+                    severity=Severity.MEDIUM,
+                    layer=Layer.BACKEND,
+                    impact=6,
+                    effort=2,
+                    occurrences=1,
+                    perf_gain='Saves 50ms-100ms TLS handshake latency on repeated service calls'
+                ))
+
+    def _check_db_config(self, src: str, lines: List[str], rel: str):
+        # NODE010: Pool max too small
+        try:
+            cfg = json.loads(src)
+            pool = cfg.get('pool', cfg.get('database', {}).get('pool', {}))
+            if isinstance(pool, dict):
+                max_conn = pool.get('max', pool.get('maximum', None))
+                if max_conn is not None and int(max_conn) < 5:
+                    line_no, snippet = self._find_line(lines, '"max"')
+                    if not self._is_suppressed(lines, line_no - 1, 'NODE010'):
+                        self.issues.append(Issue(
+                            id='NODE010',
+                            title=f'Database Connection Pool Too Small (max = {max_conn})',
+                            description=f'Database pool max size configured to only {max_conn}. Under concurrent requests, operations queue waiting for an available DB connection, artificially inflating request latency.',
+                            fix='Increase pool max to 10-20 connections based on CPU cores and RDS tier.',
+                            code_before=f'"pool": {{ "max": {max_conn}, "min": 0 }}',
+                            code_after='"pool": { "max": 15, "min": 2, "acquire": 30000, "idle": 10000 }',
+                            file=rel,
+                            line_number=line_no,
+                            code_snippet=snippet,
+                            category='Database Configuration',
+                            severity=Severity.HIGH,
+                            layer=Layer.BACKEND,
+                            impact=8,
+                            effort=1,
+                            occurrences=1,
+                            perf_gain='Eliminates connection queue wait delays under concurrent load'
+                        ))
+        except Exception:
+            pass
