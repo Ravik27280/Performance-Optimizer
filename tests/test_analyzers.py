@@ -132,5 +132,22 @@ export function UserList() {
         self.assertGreater(scores['overall'], 0)
         self.assertLessEqual(scores['overall'], 100)
 
+    def test_angular_template_filtering(self):
+        # Plain static HTML with documentation mentioning *ngFor should not be flagged
+        html_file = self.path / 'docs.html'
+        html_file.write_text("<p>We support un-tracked *ngFor and @for loops</p>", encoding='utf-8')
+        analyzer = AngularAnalyzer(str(self.path))
+        issues = analyzer.analyze()
+        self.assertFalse(any(i.id == 'ANG009' for i in issues))
+
+    def test_angular_ngfor_detection(self):
+        # Real Angular template with un-tracked *ngFor must be flagged
+        tpl_file = self.path / 'list.component.html'
+        tpl_file.write_text('<div *ngFor="let item of items">{{ item.name }}</div>', encoding='utf-8')
+        analyzer = AngularAnalyzer(str(self.path))
+        issues = analyzer.analyze()
+        self.assertTrue(any(i.id == 'ANG009' for i in issues))
+
 if __name__ == '__main__':
     unittest.main()
+

@@ -1,50 +1,108 @@
 # Performance Optimizer v2.5 PRO — Advanced Multi-Stack Analyzer
 
-> **NOT SonarQube.** This is a pure performance & scalability intelligence engine.  
-> Focus: Angular 16-19 UI performance, React 18-19 hooks & reconciliation, Node.js event loop & memory leaks, SQL/RDS query optimization, AWS serverless latency.
+> **NOT SonarQube.** This is an enterprise static performance & latency intelligence engine.  
+> **Targeted Runtimes**: Angular (14–19+), React (17–19+) & Next.js, Node.js & Seneca.js, SQL / Database Indexes, and AWS Serverless.  
+> Zero external dependencies — runs in `<0.05s` with Python 3.7+ standard library.
+
+[![Live Portal](https://img.shields.io/badge/Live_Portal-GitHub_Pages-6366f1?style=for-the-badge&logo=github)](https://ravik27280.github.io/Performance-Optimizer/)
+[![Python 3.7+](https://img.shields.io/badge/Python-3.7+-06b6d4?style=for-the-badge&logo=python)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-10b981?style=for-the-badge)](https://opensource.org/licenses/MIT)
+
+🌐 **Live Interactive Web Portal & Diagnostic Scanner**: [https://ravik27280.github.io/Performance-Optimizer/](https://ravik27280.github.io/Performance-Optimizer/)
 
 ---
 
-## 🚀 Quick Start
+## ⚡ Installation & CLI Setup
+
+Install locally or as an editable package for global terminal access:
 
 ```bash
-# Needs Python 3.7+ (No external packages required — pure standard library!)
-python3 --version
+# Clone the repository
+git clone https://github.com/Ravik27280/Performance-Optimizer.git
+cd Performance-Optimizer
 
-# Scan monorepo
-python3 optimizer.py --project /path/to/monorepo
+# Install package globally / in virtual environment
+pip install -e .
 
-# Scan separate frontend and backend repos
-python3 optimizer.py --frontend ./angular-app --backend ./node-api
-
-# CI/CD Quality Gate (Fail build if critical issues or score < 75)
-python3 optimizer.py --frontend ./fe --backend ./be --fail-on critical --min-score 75
-
-# Output JSON report + PR markdown summary
-python3 optimizer.py --project ./repo --json --markdown-summary pr_comment.md
+# Verify CLI installation
+perf-optimizer --help
 ```
+
+---
+
+## 🚀 Quick Start Examples
+
+```bash
+# 1. Scan current repository / monorepo
+perf-optimizer --project .
+
+# 2. Scan separate frontend and backend directories
+perf-optimizer --frontend ./angular-app --backend ./node-api
+
+# 3. Enforce CI/CD Quality Gate (Exit 1 on critical issues or score < 75)
+perf-optimizer --project . --fail-on critical --min-score 75
+
+# 4. Generate HTML dashboard, JSON audit, and PR Markdown summary
+perf-optimizer --project . --json --markdown-summary pr_summary.md --output report.html
+
+# 5. Alternatively, run directly with python (zero pip packages required)
+python optimizer.py --project . --verbose
+```
+
+---
 
 ## 📊 Output Formats
 
-- `performance_report.html` — Interactive executive dashboard with Live Fix Simulator, Code Diffs, and Dark/Light mode.
-- `performance_report.json` — Machine-readable audit data for automated tooling.
-- `pr_comment.md` — Formatted summary table ready for GitHub/GitLab Pull Request comments.
+- **`performance_report.html`** — Interactive executive dashboard with code diff previews, ROI impact calculations, and dark/light modes.
+- **`performance_report.json`** — Machine-readable audit data with exact line numbers and defect categories for custom tooling.
+- **`pr_summary.md`** — Markdown report table designed for automated Pull Request comments in GitHub Actions and GitLab CI.
 
 ---
 
-## 🛡️ CI/CD Quality Gates & CLI Options
+## 🤖 GitHub Actions CI/CD Integration
+
+Create `.github/workflows/perf-audit.yml` to automatically run audits on every Pull Request:
+
+```yaml
+name: Performance Quality Gate
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Performance Optimizer
+        run: pip install -e .
+      - name: Run Performance Audit
+        run: |
+          perf-optimizer --project . --fail-on critical --min-score 75
+```
+
+---
+
+## 🛡️ CLI Flags & Options
 
 | Argument | Description | Example |
 |---|---|---|
-| `--frontend`, `-f` | Path to Angular frontend codebase | `--frontend ./frontend` |
-| `--backend`, `-b` | Path to Node.js/Seneca/Express codebase | `--backend ./backend` |
-| `--project`, `-p` | Path to monorepo (scans entire workspace) | `--project .` |
-| `--fail-on` | Fails with exit code `1` if issues matching severity exist | `--fail-on critical` or `--fail-on high` |
-| `--min-score` | Fails with exit code `1` if overall score is below threshold | `--min-score 75` |
+| `--project`, `-p` | Path to monorepo or project (scans entire workspace) | `--project .` |
+| `--frontend`, `-f` | Path to Angular or React frontend codebase | `--frontend ./src/web` |
+| `--backend`, `-b` | Path to Node.js/Seneca/Express codebase | `--backend ./src/api` |
+| `--fail-on` | Fails CI with exit code `1` if issues matching severity exist | `--fail-on critical` or `--fail-on high` |
+| `--min-score` | Fails CI with exit code `1` if overall score is below threshold | `--min-score 75` |
 | `--exclude`, `-e` | Comma-separated directory patterns to exclude | `--exclude "legacy,tmp,e2e"` |
 | `--json`, `-j` | Generates machine-readable JSON report | `--json` |
 | `--markdown-summary`, `-m` | Generates PR comment summary file | `--markdown-summary pr_summary.md` |
 | `--output`, `-o` | Custom HTML report output path | `--output ./dist/perf_report.html` |
+| `--verbose`, `-v` | Detailed terminal output during scan | `--verbose` |
 
 ---
 

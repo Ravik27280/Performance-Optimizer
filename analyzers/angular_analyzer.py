@@ -33,6 +33,8 @@ class AngularAnalyzer:
                 continue
             try:
                 src = f.read_text(encoding='utf-8', errors='ignore')
+                if not self._is_angular_template(f, src):
+                    continue
                 rel = str(f.relative_to(self.path)).replace('\\', '/')
                 lines = src.splitlines()
                 self._check_template(src, lines, rel)
@@ -51,6 +53,25 @@ class AngularAnalyzer:
                 pass
 
         return self.issues
+
+    def _is_angular_template(self, f: Path, src: str) -> bool:
+        # Standard Angular component template convention: *.component.html
+        if f.name.endswith('.component.html'):
+            return True
+        # Angular workspace indicators
+        if (self.path / 'angular.json').exists():
+            return True
+        # Associated component TS file exists in the same folder
+        stem = f.stem
+        if (f.parent / f"{stem}.ts").exists() or (f.parent / f"{stem}.component.ts").exists():
+            return True
+        # Definite Angular template syntax directives
+        angular_directives = [
+            '*ngIf=', '*ngFor=', '[ngClass]=', '[ngStyle]=',
+            '(click)=', '[(ngModel)]=', '<router-outlet',
+            '@defer', '@for ('
+        ]
+        return any(d in src for d in angular_directives)
 
     def _is_suppressed(self, lines: List[str], line_idx: int, rule_id: str) -> bool:
         """Checks for // perf-ignore [RULE_ID] on current or previous line."""
@@ -259,12 +280,12 @@ class AngularAnalyzer:
 
     def _check_template(self, src: str, lines: List[str], rel: str):
         # ANG009: *ngFor without trackBy or @for without track
-        ngfor_matches = len(re.findall(r'\*ngFor', src))
-        trackby_matches = len(re.findall(r'trackBy', src))
+        ngfor_matches = len(re.findall(r'\*ngFor\s*=\s*["\']', src))
+        trackby_matches = len(re.findall(r'trackBy\s*:', src)) + len(re.findall(r'trackBy\s*=', src))
         for_without_track = re.findall(r'@for\s*\([^;)]+\)', src) # missing track
 
         if ngfor_matches > trackby_matches:
-            line_no, snippet = self._find_line(lines, '*ngFor')
+            line_no, snippet = self._find_line(lines, re.compile(r'\*ngFor\s*=\s*["\']'))
             if not self._is_suppressed(lines, line_no - 1, 'ANG009'):
                 self.issues.append(Issue(
                     id='ANG009',
