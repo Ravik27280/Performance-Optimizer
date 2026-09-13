@@ -4,28 +4,34 @@
 > **Targeted Runtimes**: Angular (14–19+), React (17–19+) & Next.js, Node.js & Seneca.js, SQL / Database Indexes, and AWS Serverless.  
 > Zero external dependencies — runs in `<0.05s` with Python 3.7+ standard library.
 
-[![Live Portal](https://img.shields.io/badge/Live_Portal-GitHub_Pages-6366f1?style=for-the-badge&logo=github)](https://ravik27280.github.io/Performance-Optimizer/)
-[![Python 3.7+](https://img.shields.io/badge/Python-3.7+-06b6d4?style=for-the-badge&logo=python)](https://www.python.org/)
+[![PyPI](https://img.shields.io/pypi/v/performance-optimizer.svg?style=for-the-badge&logo=pypi&color=6366f1)](https://pypi.org/project/performance-optimizer/)
+[![Live Portal](https://img.shields.io/badge/Live_Portal-GitHub_Pages-06b6d4?style=for-the-badge&logo=github)](https://ravik27280.github.io/Performance-Optimizer/)
+[![Python 3.7+](https://img.shields.io/badge/Python-3.7+-4f46e5?style=for-the-badge&logo=python)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-10b981?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
-🌐 **Live Interactive Web Portal & Diagnostic Scanner**: [https://ravik27280.github.io/Performance-Optimizer/](https://ravik27280.github.io/Performance-Optimizer/)
+📦 **PyPI Package**: [https://pypi.org/project/performance-optimizer/](https://pypi.org/project/performance-optimizer/)  
+🌐 **Live Web Portal & Interactive Scanner**: [https://ravik27280.github.io/Performance-Optimizer/](https://ravik27280.github.io/Performance-Optimizer/)
 
 ---
 
 ## ⚡ Installation & CLI Setup
 
-Install locally or as an editable package for global terminal access:
+Install directly from PyPI (Python Package Index):
 
 ```bash
-# Clone the repository
-git clone https://github.com/Ravik27280/Performance-Optimizer.git
-cd Performance-Optimizer
-
-# Install package globally / in virtual environment
-pip install -e .
+# Install the official release
+pip install performance-optimizer
 
 # Verify CLI installation
 perf-optimizer --help
+```
+
+Or install from source for development:
+
+```bash
+git clone https://github.com/Ravik27280/Performance-Optimizer.git
+cd Performance-Optimizer
+pip install -e .
 ```
 
 ---
