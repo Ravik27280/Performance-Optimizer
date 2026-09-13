@@ -33,6 +33,10 @@ dependencies = []
 perf-optimizer = "optimizer:main"
 performance-optimizer = "optimizer:main"
 
+[tool.setuptools]
+py-modules = ["optimizer"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["analyzers*", "core*", "reporter*"]
+
